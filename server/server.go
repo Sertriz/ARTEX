@@ -171,6 +171,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	}
 	s.initSetupToken()
 	s.initSideQuestions()
+	if m != nil {
+		go m.cve.autoSync(ctx) // no-op unless ARTEX_CVE_SYNC_INTERVAL is set
+	}
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
 	// and again on every policy save (saveLLMRetryPolicy).
 	s.applyRetryPolicy()
@@ -838,6 +841,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	mux.HandleFunc("GET /api/settings/noise", s.noiseStatus) // current noise profile + per-host counters (no reset)
+	// CVE correlation feed: status, reload of the feed dir, sync from the NVD API.
+	mux.HandleFunc("GET /api/settings/cve", s.cveStatus)
+	mux.HandleFunc("POST /api/settings/cve/reload", s.cveReload)
+	mux.HandleFunc("POST /api/settings/cve/sync", s.cveSync)
 	// Vulnerability IM push. Channels are "multi-instance + per-instance filter rules" resources, so they get their own group of
 	// REST endpoints instead of being stuffed into the flat /api/settings key-value store.
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)

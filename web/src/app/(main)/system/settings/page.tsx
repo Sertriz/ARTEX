@@ -15,6 +15,7 @@ import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
 import type { Settings } from "@/lib/types";
 
+import { CveFeedCard } from "./cve-feed-card";
 import { NoiseProfileCard } from "./noise-profile-card";
 
 export default function SystemSettingsPage() {
@@ -295,6 +296,7 @@ export default function SystemSettingsPage() {
         </Card>
 
         <NoiseProfileCard />
+        <CveFeedCard />
 
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
