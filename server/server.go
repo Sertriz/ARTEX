@@ -4257,7 +4257,12 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	}
 	var ledger *db.CoverageLedger
 	if t.CoverageEnabled {
-		ledger, _ = s.m.Assets().CoverageLedger(taskID)
+		// nil means "coverage off" to the renderer, so a failed read must not become nil.
+		if ledger, err = s.m.Assets().CoverageLedger(taskID); err != nil {
+			log.Printf("[report] task=%s coverage ledger: %v", t.ID, err)
+			writeErr(w, 500, "report unavailable: the coverage ledger lookup failed, retry")
+			return
+		}
 	}
 	// The exploration node payload carries only name/summary/evidence/severity/
 	// vulnclass. Everything the report says about proof strength (poe level,

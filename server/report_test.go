@@ -84,7 +84,7 @@ func TestGetReportTriageAndTaskAssets(t *testing.T) {
 	}
 	md := w.Body.String()
 	for _, want := range []string{
-		"- Findings: **3** (1 confirmed, 1 awaiting triage, 1 risk accepted)",
+		"- Findings: **3** (1 confirmed, 1 pending, 1 risk accepted)",
 		"- Excluded at triage: **3** (1 false positive, 1 duplicate, 1 ignored)",
 		"- Assets: root_domain 2\n",
 		"kept-confirmed", "kept-pending", "kept-accepted",
@@ -98,5 +98,35 @@ func TestGetReportTriageAndTaskAssets(t *testing.T) {
 		if strings.Contains(md, gone) {
 			t.Errorf("report contains %q\n%s", gone, md)
 		}
+	}
+
+	// The no-LLM chat summary counts the same way.
+	if reply := s.fallbackChat(own, "status"); !strings.Contains(reply, "assets 2,") || !strings.Contains(reply, "findings 3.") {
+		t.Errorf("fallbackChat reply = %q, want assets 2 and findings 3", reply)
+	}
+}
+
+// A read that fails must fail the report, not render it as "no findings". The
+// task lives only in memory, so closing the pool leaves no rows behind.
+func TestGetReportFailsOnReadError(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer m.Close()
+	s := &Server{m: m}
+	const id = "report-read-failure"
+	m.mu.Lock()
+	m.tasks[id] = &Task{ID: id, Store: m.pg.Exploration(0)}
+	m.mu.Unlock()
+	if err := m.pg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	s.getReport(w, httptest.NewRequest("GET", "/api/report?task="+id, nil))
+	// The body names the failing read: the later quality lookup would also answer 500
+	// on a closed pool and hide a regression of this check.
+	if w.Code != 500 || !strings.Contains(w.Body.String(), "findings lookup failed") {
+		t.Fatalf("report on a failed read: %d %s", w.Code, w.Body)
 	}
 }

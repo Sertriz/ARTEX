@@ -81,7 +81,7 @@ func Markdown(in Input) string {
 		v := parseFinding(n)
 		v.Q = qualityFromRows(n.ID, in.Quality)
 		if db.FindingDismissed(v.Q.Status) {
-			dismissed.add(strings.ReplaceAll(v.Q.Status, "_", " "))
+			dismissed.add(statusWords(v.Q.Status))
 			continue
 		}
 		listed.add(triageGroup(v.Q))
@@ -117,7 +117,13 @@ func Markdown(in Input) string {
 	// findings
 	fmt.Fprintf(&b, "## Findings\n\n")
 	if len(fs) == 0 {
-		b.WriteString("_No vulnerabilities confirmed this time._\n\n")
+		// A duplicate or ignored finding was a real result set aside by the operator,
+		// so "nothing confirmed" is only true when every exclusion was a false positive.
+		if dismissed.total > dismissed.n["false positive"] {
+			b.WriteString("_No findings are listed: every finding of this task was excluded at triage (see the summary)._\n\n")
+		} else {
+			b.WriteString("_No vulnerabilities confirmed this time._\n\n")
+		}
 	} else {
 		sort.SliceStable(fs, func(i, j int) bool { return sevRank[fs[i].Severity] < sevRank[fs[j].Severity] })
 		for i, f := range fs {
@@ -158,23 +164,22 @@ func Markdown(in Input) string {
 	return b.String()
 }
 
-// Summary groups of the listed findings, in the order the summary prints them.
+// Summary groups of the listed findings, in the order the summary prints them. A
+// finding with a row is counted under its own triage state, named as the Status
+// bullet names it, so the summary and the listing never disagree.
 const (
-	groupConfirmed = "confirmed"
-	groupAwaiting  = "awaiting triage"
-	groupFixed     = "fixed"
-	groupAccepted  = "risk accepted"
-	groupNoRecord  = "without a finding record"
-	groupUnknown   = "triage state unknown"
+	groupNoRecord = "without a finding record"
+	groupUnknown  = "triage state unknown"
 )
 
-var triageGroupOrder = []string{groupConfirmed, groupAwaiting, groupFixed, groupAccepted, groupNoRecord, groupUnknown}
+var triageGroupOrder = []string{"confirmed", "pending", "in progress", "resolved", "fixed", "risk accepted", groupNoRecord, groupUnknown}
 
 var dismissedOrder = []string{"false positive", "duplicate", "ignored"}
 
 // triageGroup names the summary group of a finding the report lists. A finding
-// whose row could not be read is "triage state unknown", never "awaiting triage":
-// a failed lookup says nothing about what the operator decided.
+// whose row could not be read is "triage state unknown", never "pending": a
+// failed lookup says nothing about what the operator decided. An unrecognised
+// state is printed verbatim, never hidden.
 func triageGroup(q Quality) string {
 	switch {
 	case q.Unavailable:
@@ -182,17 +187,13 @@ func triageGroup(q Quality) string {
 	case q.Missing:
 		return groupNoRecord
 	}
-	switch q.Status {
-	case db.FindingConfirmed:
-		return groupConfirmed
-	case "", db.FindingPending, db.FindingInProgress:
-		return groupAwaiting
-	case db.FindingResolved, db.FindingFixed:
-		return groupFixed
-	case db.FindingRiskAccepted:
-		return groupAccepted
-	}
-	return q.Status // an unrecognised state is printed verbatim, never hidden
+	return statusWords(q.Status)
+}
+
+// statusWords renders a triage state for a summary line: "risk_accepted" becomes
+// "risk accepted", and an empty state is the column default, pending.
+func statusWords(status string) string {
+	return strings.ReplaceAll(nz(status, db.FindingPending), "_", " ")
 }
 
 // tally counts findings per group for one summary line.

@@ -335,7 +335,7 @@ func TestMarkdownTriage(t *testing.T) {
 	}
 	md := Markdown(Input{Title: "t", Findings: nodes, Quality: rows, AssetCounts: map[string]int{"ip": 4, "service": 0}})
 	for _, want := range []string{
-		"- Findings: **7** (1 confirmed, 2 awaiting triage, 2 fixed, 1 risk accepted, 1 without a finding record)\n",
+		"- Findings: **7** (1 confirmed, 1 pending, 1 in progress, 1 resolved, 1 fixed, 1 risk accepted, 1 without a finding record)\n",
 		"- Excluded at triage: **3** (1 false positive, 1 duplicate, 1 ignored)\n",
 		"- Assets: ip 4\n",
 		"- **Status**: confirmed\n- **Finding record**: #1\n",
@@ -357,6 +357,14 @@ func TestMarkdownTriage(t *testing.T) {
 	if n := strings.Count(md, "\n### "); n != 7 {
 		t.Errorf("listed %d findings, want 7\n%s", n, md)
 	}
+	// A node without a row has no triage state to print: no Status bullet, only the
+	// not-assessed line.
+	if !strings.Contains(md, "finding-10\n\ns10\n\n- **Verification**: not assessed") {
+		t.Errorf("finding without a record carries a Status line\n%s", md)
+	}
+	if n := strings.Count(md, "- **Status**"); n != 6 {
+		t.Errorf("rendered %d status lines, want 6 (nodes 1-6)\n%s", n, md)
+	}
 
 	// A failed lookup lists everything and claims no triage decision.
 	md = Markdown(Input{Title: "t", Findings: nodes[:2]})
@@ -370,5 +378,12 @@ func TestMarkdownTriage(t *testing.T) {
 		if !strings.Contains(md, want) {
 			t.Errorf("missing %q in\n%s", want, md)
 		}
+	}
+	// A duplicate was a real result: the report must not say nothing was confirmed.
+	md = Markdown(Input{Title: "t", Findings: []*db.Node{nodes[6], nodes[7]}, Quality: rows})
+	if !strings.Contains(md, "- Excluded at triage: **2** (1 false positive, 1 duplicate)\n") ||
+		!strings.Contains(md, "every finding of this task was excluded at triage") ||
+		strings.Contains(md, "No vulnerabilities confirmed") {
+		t.Errorf("all-dismissed report with a duplicate claims nothing was confirmed\n%s", md)
 	}
 }
