@@ -65,6 +65,18 @@ func ValidFindingStatus(s string) bool {
 	return false
 }
 
+// FindingDismissed reports whether a triage state takes a finding out of the task
+// report: not a vulnerability (false_positive), already reported under another
+// finding (duplicate), or set aside by the operator (ignored). risk_accepted is not
+// dismissed: the vulnerability is real, and the report lists it with that status.
+func FindingDismissed(status string) bool {
+	switch status {
+	case FindingFalsePositive, FindingDuplicate, FindingIgnored:
+		return true
+	}
+	return false
+}
+
 // Finding severity levels (findings.severity).
 const (
 	SeverityCritical = "critical" // Critical

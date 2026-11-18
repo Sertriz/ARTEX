@@ -19,6 +19,7 @@ import (
 // printed, never silently dropped — a report that hides its own weakness is
 // worth less than one that states it.
 type Quality struct {
+	Status                string // triage state of the standalone row ("" when there is no row)
 	PoE                   int
 	Verification          string
 	VerificationNote      string
@@ -67,6 +68,7 @@ func qualityFromRows(nodeID int64, rows map[int64]db.FindingQuality) Quality {
 		return Quality{Missing: true}
 	}
 	return Quality{
+		Status:                q.Status,
 		PoE:                   q.PoeLevel,
 		Verification:          q.VerificationStatus,
 		VerificationNote:      q.VerificationNote,
@@ -83,6 +85,7 @@ func qualityFromRows(nodeID int64, rows map[int64]db.FindingQuality) Quality {
 // qualityFromDBFinding builds a Quality from a standalone findings row.
 func qualityFromDBFinding(f *db.DBFinding) Quality {
 	return Quality{
+		Status:                f.Status,
 		PoE:                   f.PoELevel,
 		Verification:          f.VerificationStatus,
 		VerificationNote:      f.VerificationNote,
