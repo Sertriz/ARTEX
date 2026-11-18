@@ -44,9 +44,12 @@ type Candidate struct {
 	// BackportRisk is true for a version-confirmed match on a distribution build,
 	// whose package may carry the fix without a new upstream version.
 	BackportRisk bool
-	// Platforms is set when NVD limits the CVE to a platform the observation did
-	// not reveal (the lead holds only if the host runs one of them). A record whose
-	// platform the observation contradicts is not a candidate at all.
+	// Platforms is set when NVD limits the CVE to platforms the observation could
+	// not confirm (the lead holds only if the host runs one of them): the host's
+	// platform is unknown, its Linux distribution is unknown and the record names
+	// distributions, or the record also names a platform outside the known
+	// families ("other") that the scan cannot rule out. A record whose platforms
+	// the observation contradicts is not a candidate at all.
 	Platforms PlatformSet
 }
 

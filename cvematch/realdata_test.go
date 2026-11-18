@@ -2,6 +2,7 @@ package cvematch
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -27,7 +28,11 @@ import (
 //     "9.16.8-S1 through 9.16.41-S1"), records limited to distributions
 //     (CVE-2026-123158 OpenSSH on Alpine Linux, CVE-2015-1565 on Windows,
 //     novell:opensuse or RHEL, CVE-2007-5795 with a Debian-only and a plain
-//     configuration), and ProFTPD's "1.3.5:*" pin fixed in 1.3.5a (CVE-2015-3306).
+//     configuration, CVE-2009-2939 spelled o:ubuntu:ubuntu_linux, CVE-2022-23238
+//     with linux_kernel among its distributions, CVE-2022-46340 limited to RHEL
+//     by one configuration while another marks Debian vulnerable), ProFTPD's
+//     "1.3.5:*" pin fixed in 1.3.5a (CVE-2015-3306), and OpenSSH errata
+//     (CVE-2011-4327 "before 5.8p2" filed "<= 5.8", CVE-2002-0575 pinning 2.9.9).
 //   - CVE-2024-6387.json.gz: the full, untrimmed regreSSHion record, gzipped.
 func loadRealData(t *testing.T) *NVDSource {
 	t.Helper()
@@ -35,8 +40,8 @@ func loadRealData(t *testing.T) *NVDSource {
 	if err != nil {
 		t.Fatalf("load testdata: %v", err)
 	}
-	if st := src.Stats(); st.Files != 5 || st.ErrorFiles != 0 || st.CVEs != 32 {
-		t.Fatalf("testdata stats %+v, want 5 files and 32 CVEs", st)
+	if st := src.Stats(); st.Files != 5 || st.ErrorFiles != 0 || st.CVEs != 37 {
+		t.Fatalf("testdata stats %+v, want 5 files and 37 CVEs", st)
 	}
 	return src
 }
@@ -271,6 +276,16 @@ func TestRealDataUpdateAnyPins(t *testing.T) {
 		{ssh("7.1p2"), "CVE-2016-0777", false},
 		{ssh("3.7.1p1"), "CVE-2003-0787", true},
 		{ssh("3.7.1p2"), "CVE-2003-0787", false},
+		// 5.8:* beside 5.8:p1 is not the CVE's last release: every 5.8 build.
+		{ssh("5.8p1"), "CVE-2016-0777", true},
+		{ssh("5.8p2"), "CVE-2016-0777", true},
+		// Errata: "before 5.8p2" filed "<= 5.8"; "before 2.9.9" with 2.9.9 pinned.
+		{ssh("5.8"), "CVE-2011-4327", true},
+		{ssh("5.8p1"), "CVE-2011-4327", true},
+		{ssh("5.8p2"), "CVE-2011-4327", false},
+		{ssh("2.9p2"), "CVE-2002-0575", true},
+		{ssh("2.9.9"), "CVE-2002-0575", false},
+		{ssh("2.9.9p1"), "CVE-2002-0575", false},
 		{ssh("9.2p1"), "CVE-2023-25136", false},
 		{ssh("9.3p1"), "CVE-2023-38408", true}, // pinned 9.3:p1
 		{ssh("9.3p2"), "CVE-2023-38408", false},
@@ -416,6 +431,50 @@ func TestRealDataDistroRecordKinds(t *testing.T) {
 		if !ok || c.Platforms != 0 {
 			t.Errorf("emacs on %s: matched = %v, only on %v; want the unconditional record", os, ok, c.Platforms.Names())
 		}
+	}
+
+	// want: "" dropped, "any" kept unconditional, else kept only on those names.
+	cases := []struct {
+		app, os, cve, want string
+	}{
+		// Debian and Ubuntu (spelled o:ubuntu:ubuntu_linux) packaging only.
+		{"cpe:/a:postfix:postfix:2.5.5", "cpe:/o:centos:centos", "CVE-2009-2939", ""},
+		{"cpe:/a:postfix:postfix:2.5.5", "cpe:/o:alpinelinux:alpine_linux", "CVE-2009-2939", ""},
+		{"cpe:/a:postfix:postfix:2.5.5", "cpe:/o:canonical:ubuntu_linux", "CVE-2009-2939", "any"},
+		{"cpe:/a:postfix:postfix:2.5.5", "cpe:/o:linux:linux_kernel", "CVE-2009-2939", "debian"},
+		// linux_kernel among the platforms: any Linux.
+		{"cpe:/a:netapp:storagegrid:11.6.0.1", "cpe:/o:suse:linux_enterprise_server", "CVE-2022-23238", "any"},
+		{"cpe:/a:netapp:storagegrid:11.6.0.1", "cpe:/o:alpinelinux:alpine_linux", "CVE-2022-23238", "any"},
+		{"cpe:/a:netapp:storagegrid:11.6.0.1", "cpe:/o:microsoft:windows", "CVE-2022-23238", ""},
+		// "x_server on RHEL", while the CVE also marks Debian 11 vulnerable.
+		{"cpe:/a:x.org:x_server:1.20.4", "cpe:/o:debian:debian_linux", "CVE-2022-46340", "any"},
+		{"cpe:/a:x.org:x_server:1.20.4", "cpe:/o:redhat:enterprise_linux", "CVE-2022-46340", "any"},
+		{"cpe:/a:x.org:x_server:1.20.4", "cpe:/o:alpinelinux:alpine_linux", "CVE-2022-46340", ""},
+		{"cpe:/a:x.org:x_server:1.20.4", "cpe:/o:linux:linux_kernel", "CVE-2022-46340", "debian/redhat"},
+		{"cpe:/a:x.org:x_server:1.20.4", "cpe:/o:microsoft:windows", "CVE-2022-46340", ""},
+	}
+	for _, c := range cases {
+		cand, ok := find(Observation{CPEs: []string{c.app, c.os}}, c.cve)
+		got := ""
+		switch {
+		case !ok:
+		case cand.Platforms == 0:
+			got = "any"
+		default:
+			got = strings.Join(cand.Platforms.Names(), "/")
+		}
+		if got != c.want {
+			t.Errorf("%s on %s: %s = %q, want %q", c.app, c.os, c.cve, got, c.want)
+		}
+	}
+
+	// httpx joins every technology name into the banner text: a JS library named
+	// Alpine.js is no distribution, and Win64 says Windows (CVE-2024-4577 is PHP-CGI
+	// on Windows only).
+	xampp := Observation{Product: "PHP", Version: "8.2.12",
+		Extra: "Apache/2.4.58 (Win64) OpenSSL/3.1.3 PHP/8.2.12 PHP:8.2.12 Apache HTTP Server:2.4.58 Windows Server Alpine.js:3.13.3"}
+	if c, ok := find(xampp, "CVE-2024-4577"); !ok || c.Platforms != 0 {
+		t.Errorf("xampp: CVE-2024-4577 matched = %v, only on %v; want unconditional", ok, c.Platforms.Names())
 	}
 }
 

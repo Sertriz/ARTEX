@@ -314,7 +314,8 @@ func platformOf(c CPE) PlatformSet {
 // the kernel or a distribution outside the lineages.
 func distroLineageOfCPE(c CPE) PlatformSet {
 	switch {
-	case c.Vendor == "debian" && c.Product == "debian_linux", c.Vendor == "canonical" && c.Product == "ubuntu_linux",
+	case c.Vendor == "debian" && (c.Product == "debian_linux" || c.Product == "linux"),
+		(c.Vendor == "canonical" || c.Vendor == "ubuntu") && (c.Product == "ubuntu_linux" || c.Product == "linux"),
 		c.Product == "raspbian":
 		return PlatformDebian
 	case c.Vendor == "redhat" && (c.Part == "o" || strings.HasPrefix(c.Product, "enterprise_linux") || c.Product == "linux"),
@@ -323,7 +324,7 @@ func distroLineageOfCPE(c CPE) PlatformSet {
 		c.Vendor == "amazon" && (c.Product == "linux" || c.Product == "amazon_linux" || strings.HasPrefix(c.Product, "linux_")):
 		return PlatformRedHat
 	case c.Vendor == "suse" || c.Vendor == "opensuse" || c.Vendor == "opensuse_project" ||
-		c.Vendor == "novell" && strings.Contains(c.Product, "suse"):
+		c.Vendor == "novell" && (strings.Contains(c.Product, "suse") || strings.Contains(c.Product, "linux")):
 		return PlatformSUSE
 	case c.Vendor == "alpinelinux" && c.Product == "alpine_linux":
 		return PlatformAlpine
@@ -360,6 +361,12 @@ func observedPlatform(osCPEs []CPE, distro string, texts ...string) PlatformSet 
 			return f
 		}
 	}
+	// A distribution here was read from banner text, as was any Windows evidence
+	// (Win64, Microsoft-IIS): the explicit Windows server wins.
+	all := strings.ToLower(strings.Join(texts, " "))
+	if windowsTextRe.MatchString(all) {
+		return PlatformWindows
+	}
 	switch distro {
 	case "":
 	case "freebsd":
@@ -367,11 +374,7 @@ func observedPlatform(osCPEs []CPE, distro string, texts ...string) PlatformSet 
 	default:
 		return PlatformLinux
 	}
-	all := strings.ToLower(strings.Join(texts, " "))
-	switch {
-	case windowsTextRe.MatchString(all):
-		return PlatformWindows
-	case unixTextRe.MatchString(all):
+	if unixTextRe.MatchString(all) {
 		return platformUnix
 	}
 	return 0
@@ -433,13 +436,14 @@ var distroPatterns = []struct {
 	{"raspbian", regexp.MustCompile(`raspbian`)},
 	{"ubuntu", regexp.MustCompile(`ubuntu`)},
 	{"debian", regexp.MustCompile(`debian|\+deb[0-9]|deb[0-9]+u[0-9]+`)},
-	{"rocky", regexp.MustCompile(`rocky`)},
+	{"rocky", regexp.MustCompile(`\brocky\b`)},
 	{"almalinux", regexp.MustCompile(`almalinux`)},
-	{"centos", regexp.MustCompile(`centos`)},
-	{"rhel", regexp.MustCompile(`red ?hat|rhel|\.el[0-9]+`)},
+	{"centos", regexp.MustCompile(`\bcentos\b`)},
+	{"rhel", regexp.MustCompile(`red ?hat|\brhel|\.el[0-9]+`)},
 	{"fedora", regexp.MustCompile(`fedora|\.fc[0-9]+`)},
-	{"suse", regexp.MustCompile(`suse|sles`)},
-	{"alpine", regexp.MustCompile(`alpine`)},
+	{"suse", regexp.MustCompile(`suse\b|\bsles\b`)},
+	// Not the Alpine.js library an httpx technology list can name.
+	{"alpine", regexp.MustCompile(`\balpine($|[^.\w])`)},
 	{"amazon", regexp.MustCompile(`amzn|amazon linux`)},
 	{"freebsd", regexp.MustCompile(`freebsd`)},
 }

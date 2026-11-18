@@ -380,17 +380,25 @@ type loader struct {
 	versionID map[string]uint32
 	stats     LoadStats
 
-	// Per-CVE scratch for update-ANY pins, see add.
-	anyPins  []anyPin
-	portable map[string]bool
+	// Per-CVE scratch, see add.
+	anyPins    []anyPin
+	portable   map[string]bool
+	distroRecs []recRef
 }
 
-// anyPin locates an exact pin with update ANY that add indexed for the current CVE.
-type anyPin struct {
+// recRef locates a record add indexed for the current CVE.
+type recRef struct {
 	bucket map[string][]rec
 	vendor string // bucket key
 	i      int
-	cpe    CPE
+}
+
+func (r recRef) rec() *rec { return &r.bucket[r.vendor][r.i] }
+
+// anyPin is an exact pin with update ANY indexed for the current CVE.
+type anyPin struct {
+	recRef
+	cpe CPE
 }
 
 func newLoader() *loader {
@@ -624,6 +632,7 @@ func (l *loader) add(c nvdCVE) {
 		lastMod:  c.LastModified,
 	})
 	l.byID[id] = mi
+	var vulnLineages PlatformSet // lineages of the OS CPEs the CVE marks vulnerable
 	for _, cfg := range c.Configurations {
 		plat := configPlatform(cfg)
 		for _, node := range cfg.Nodes {
@@ -684,33 +693,82 @@ func (l *loader) add(c nvdCVE) {
 				if rule, ok := editionRules[cpe.Product]; ok && rule.vendor == cpe.Vendor && rule.edition == cpe.SWEdition {
 					r.flags |= fEdition
 				}
-				applyErrata(id, cpe, &r, l.versions)
+				if !l.applyErrata(id, cpe, &r) {
+					continue
+				}
+				if cpe.Part == "o" {
+					vulnLineages |= distroLineageOfCPE(cpe)
+				}
 				product, vendor := l.str(cpe.Product), l.str(cpe.Vendor)
 				vendors := l.byProduct[product]
 				if vendors == nil {
 					vendors = map[string][]rec{}
 					l.byProduct[product] = vendors
 				}
+				ref := recRef{bucket: vendors, vendor: vendor, i: len(vendors[vendor])}
 				if r.flags&fAnyUpdate != 0 {
-					l.anyPins = append(l.anyPins, anyPin{bucket: vendors, vendor: vendor, i: len(vendors[vendor]), cpe: cpe})
+					l.anyPins = append(l.anyPins, anyPin{recRef: ref, cpe: cpe})
+				}
+				if r.plat&platformDistros != 0 {
+					l.distroRecs = append(l.distroRecs, ref)
 				}
 				vendors[vendor] = append(vendors[vendor], r)
 			}
 		}
 	}
-	// Where the CVE also pins a portable build of a release ("7.1:p1",
-	// "3.7.1p1"), its pin of that release with update ANY means the bare release:
-	// CVE-2016-0777 pins 7.1:* and 7.1:p1 and is fixed in 7.1p2.
+	// Where the CVE also pins a portable build of the last release it names
+	// ("7.1:p1", "3.7.1p1"), its pin of that release with update ANY means the
+	// bare release: CVE-2016-0777 pins 7.1:* and 7.1:p1 and is fixed in 7.1p2.
+	// Earlier releases it pins that way (5.8:* beside 5.8:p1) are vulnerable in
+	// every build.
 	if len(l.portable) > 0 {
+		last := lastReleases(c)
 		for _, a := range l.anyPins {
-			if l.portable[a.cpe.Vendor+":"+a.cpe.Product+":"+a.cpe.Version] {
-				a.bucket[a.vendor][a.i].flags &^= fAnyUpdate
+			key := a.cpe.Vendor + ":" + a.cpe.Product
+			if l.portable[key+":"+a.cpe.Version] && CompareVersions(a.cpe.Version, last[key]) >= 0 {
+				a.rec().flags &^= fAnyUpdate
 			}
 		}
 		clear(l.portable)
 	}
+	// A distribution limit that one configuration sets also admits the
+	// distributions the CVE marks vulnerable elsewhere: X.Org's CVE-2022-46340 is
+	// "x_server on RHEL" and also lists Debian 11 as vulnerable.
+	if vulnLineages != 0 {
+		for _, ref := range l.distroRecs {
+			ref.rec().plat |= vulnLineages
+		}
+	}
 	clear(l.anyPins)
 	l.anyPins = l.anyPins[:0]
+	clear(l.distroRecs)
+	l.distroRecs = l.distroRecs[:0]
+}
+
+// lastReleases returns, per vendor:product, the highest release a CVE's
+// vulnerable criteria name, by pin or bound, without a portable suffix.
+func lastReleases(c nvdCVE) map[string]string {
+	last := map[string]string{}
+	for _, cfg := range c.Configurations {
+		for _, node := range cfg.Nodes {
+			for _, m := range node.CPEMatch {
+				if !m.Vulnerable {
+					continue
+				}
+				cpe, ok := ParseCPEName(m.Criteria)
+				if !ok {
+					continue
+				}
+				key := cpe.Vendor + ":" + cpe.Product
+				for _, v := range []string{cpe.FullVersion(), m.VersionStartIncluding, m.VersionStartExcluding, m.VersionEndIncluding, m.VersionEndExcluding} {
+					if v = stripPortable(strings.ToLower(v)); v != "" && CompareVersions(v, last[key]) > 0 {
+						last[key] = v
+					}
+				}
+			}
+		}
+	}
+	return last
 }
 
 // configPlatform returns the platforms an AND configuration limits its vulnerable
@@ -754,33 +812,57 @@ func configPlatform(cfg nvdConfigNode) PlatformSet {
 	return plat
 }
 
-// erratum corrects one NVD record bound that is demonstrably wrong.
+// erratum corrects one NVD record that is demonstrably wrong.
 type erratum struct {
 	cve, product string
 	endIncluding string // an inclusive upper bound that should be exclusive
+	endExcluding string // with endIncluding: the exclusive bound to use instead of it
+	dropPin      string // a pinned version that the description says is fixed
 }
 
 // errata lists known NVD mistakes that would otherwise flag a fixed release.
-// Both are OpenSSH "before X" bugs filed as "<= X"; the portable rule would then
-// include the fix release Xp1:
+// All are OpenSSH "before X" bugs filed as "<= X" (or with X pinned); the
+// portable rule would then include the fix release Xp1:
 //   - CVE-2024-6387 (regreSSHion), filed "<= 9.8": 9.8/9.8p1 is the fix release.
 //   - CVE-2006-5051 (the signal handler race regreSSHion reintroduced), "OpenSSH
 //     before 4.4", filed "<= 4.4": 4.4/4.4p1 is the fix release.
+//   - CVE-2003-0693 "before 3.7", CVE-2003-0695 "before 3.7.1", CVE-2001-0816
+//     and CVE-2001-1380 "before 2.9.9", each filed "<= X".
+//   - CVE-2011-4327 "before 5.8p2", filed "<= 5.8": 5.8p1 is vulnerable, 5.8p2
+//     is the fix.
+//   - CVE-2002-0575 "before 2.9.9, and 3.x before 3.2.1", which pins 2.9.9.
 var errata = []erratum{
 	{cve: "CVE-2024-6387", product: "openssh", endIncluding: "9.8"},
 	{cve: "CVE-2006-5051", product: "openssh", endIncluding: "4.4"},
+	{cve: "CVE-2003-0693", product: "openssh", endIncluding: "3.7"},
+	{cve: "CVE-2003-0695", product: "openssh", endIncluding: "3.7.1"},
+	{cve: "CVE-2001-0816", product: "openssh", endIncluding: "2.9.9"},
+	{cve: "CVE-2001-1380", product: "openssh", endIncluding: "2.9.9"},
+	{cve: "CVE-2011-4327", product: "openssh", endIncluding: "5.8", endExcluding: "5.8p2"},
+	{cve: "CVE-2002-0575", product: "openssh", dropPin: "2.9.9"},
 }
 
 // patchUpdateRe matches a CPE update that is a patch level of its release: a
 // portable/patch "p<n>" (OpenSSH, BIND's "-P2") or a single letter (ProFTPD 1.3.5a).
 var patchUpdateRe = regexp.MustCompile(`^(p[0-9]{1,3}|[a-z])$`)
 
-func applyErrata(id string, cpe CPE, r *rec, versions []string) {
+// applyErrata corrects r by the errata for the CVE; false drops the record.
+func (l *loader) applyErrata(id string, cpe CPE, r *rec) bool {
 	for _, e := range errata {
-		if e.cve == id && e.product == cpe.Product && r.flags&fEndIncl != 0 && versions[r.hi] == e.endIncluding {
+		if e.cve != id || e.product != cpe.Product {
+			continue
+		}
+		switch {
+		case e.dropPin != "" && r.flags&fExact != 0 && l.versions[r.lo] == e.dropPin:
+			return false
+		case e.endIncluding != "" && r.flags&fEndIncl != 0 && l.versions[r.hi] == e.endIncluding:
 			r.flags = r.flags&^fEndIncl | fEndExcl
+			if e.endExcluding != "" {
+				r.hi = l.version(e.endExcluding)
+			}
 		}
 	}
+	return true
 }
 
 // portableOnBound reports whether an OpenSSH portable release sits on an

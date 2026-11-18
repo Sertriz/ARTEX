@@ -108,6 +108,15 @@ func TestDetectDistro(t *testing.T) {
 		{[]string{"2.4.37 (Red Hat Enterprise Linux)"}, "rhel"},
 		{[]string{"7.4", "protocol 2.0"}, ""},
 		{[]string{"9.6", "FreeBSD 20240104"}, "freebsd"},
+		{[]string{"2.4.6-99.el7.centos.1"}, "centos"},
+		{[]string{"Alpine Linux:3.19"}, "alpine"},
+		{[]string{"nginx/1.24.0", "alpine"}, "alpine"},
+		{[]string{"openSUSE Leap 15.5"}, "suse"},
+		{[]string{"SLES 15"}, "suse"},
+		{[]string{"1.20.1 rhel8"}, "rhel"},
+		// httpx technology names that are not distributions.
+		{[]string{"Apache/2.4.58 (Win64) PHP:8.2.12 Alpine.js:3.13.3"}, ""},
+		{[]string{"nginx/1.10.0 Nginx:1.10.0 Excentos"}, ""},
 		{nil, ""},
 	}
 	for _, c := range cases {
@@ -240,6 +249,9 @@ func TestPlatforms(t *testing.T) {
 		{"iis header", nil, "", []string{"Microsoft-IIS/10.0"}, PlatformWindows},
 		{"unix comment", nil, "", []string{"Apache/2.4.49 (Unix)"}, platformUnix},
 		{"unknown", nil, "", []string{"nginx/1.18.0"}, 0},
+		// A distribution read from banner text yields to explicit Windows text.
+		{"win64 with a text distro", nil, "alpine", []string{"Apache/2.4.58 (Win64)"}, PlatformWindows},
+		{"os cpe beats windows text", []CPE{cpe("cpe:/o:canonical:ubuntu_linux")}, "ubuntu", []string{"Microsoft-IIS/10.0"}, PlatformLinux},
 	}
 	for _, c := range cases {
 		if got := observedPlatform(c.cpes, c.distro, c.texts...); got != c.want {
