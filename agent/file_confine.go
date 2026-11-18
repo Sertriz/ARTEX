@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -118,18 +120,29 @@ func (c *confinedTool) Call(ctx context.Context, in json.RawMessage, tc *actool.
 // input with that path replaced by its resolved form.
 func (p *FileToolPolicy) checkToolInput(name string, in json.RawMessage, tc *actool.ToolContext) (json.RawMessage, error) {
 	field := confinedFileTools[name]
-	var m map[string]any
-	if err := json.Unmarshal(in, &m); err != nil {
-		return in, nil // the tool reports malformed input itself
+	m, err := decodeToolInput(in)
+	if err != nil {
+		return nil, err
 	}
-	raw, _ := m[field].(string)
+	// encoding/json matches object keys to struct fields without regard to case,
+	// so the tool would read "FILE_PATH" or "Path" as its path while a lookup of
+	// the exact key saw none. Only the exact spelling is accepted.
+	for k := range m {
+		if k != field && strings.EqualFold(k, field) {
+			return nil, fmt.Errorf("the path must be given as %q, not %q", field, k)
+		}
+	}
+	raw, isStr := m[field].(string)
+	if _, present := m[field]; present && !isStr {
+		return nil, fmt.Errorf("%s must be a string", field)
+	}
 	wd := ""
 	if tc != nil {
 		wd = tc.WorkingDir
 	}
 	if strings.TrimSpace(raw) == "" {
 		if field == "file_path" {
-			return in, nil // the tool reports the missing path itself
+			return nil, errors.New("file_path is required")
 		}
 		raw = wd // LS, Glob and Grep default to the working directory
 		if raw == "" {
@@ -156,6 +169,24 @@ func (p *FileToolPolicy) checkToolInput(name string, in json.RawMessage, tc *act
 		return nil, err
 	}
 	return out, nil
+}
+
+// decodeToolInput decodes a tool input object for the check. Anything the check
+// cannot decode is refused rather than passed through: the tool decodes the same
+// bytes into its own struct, which ignores fields the check would choke on (a
+// number too large for a float64), so a pass-through would skip the check.
+// Numbers are kept as written, and the input must be a single JSON object.
+func decodeToolInput(in json.RawMessage) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(in))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil || m == nil {
+		return nil, errors.New("the input must be a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("the input must be a single JSON object")
+	}
+	return m, nil
 }
 
 // roots returns the directories a run with working directory wd may write and

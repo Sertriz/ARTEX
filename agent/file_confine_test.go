@@ -318,3 +318,44 @@ func TestFileToolConfineDenyOverridesRoot(t *testing.T) {
 	}
 	wantRefused(t, "Grep tree with a link to a denied key", callTool(t, "Grep", l.run, map[string]any{"pattern": "SECRET", "output_mode": "content"}))
 }
+
+// The tool decodes its input with encoding/json, which matches keys without
+// regard to case and skips unknown fields unparsed: the check must not read the
+// input differently.
+func TestFileToolConfineInputForms(t *testing.T) {
+	l := newConfineLayout(t)
+	key := filepath.Join(l.keys, "jwt.key")
+	raw := func(name, in string) actool.Result {
+		t.Helper()
+		res, err := sdkTool(t, name).Call(context.Background(), json.RawMessage(in), &actool.ToolContext{WorkingDir: l.run})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return res
+	}
+	for _, in := range []string{
+		`{"FILE_PATH":"` + key + `"}`,
+		`{"File_Path":"` + key + `"}`,
+		`{"file_path":"notes.txt","FILE_PATH":"` + key + `"}`,
+		`{"ﬁle_path":"` + key + `"}`, // not a fold of file_path, but must not slip through either
+		`{"file_path":"` + key + `","x":1e999}`,
+		`{"file_path":"` + key + `"} {"file_path":"notes.txt"}`,
+		`{"file_path":["` + key + `"]}`,
+		`{"file_path":""}`,
+		`{}`,
+		`[]`,
+	} {
+		res := raw("Read", in)
+		if !res.IsError || strings.Contains(res.Flatten(), "JWT-SECRET") {
+			t.Errorf("Read %s: want an error, got %q", in, res.Flatten())
+		}
+	}
+	if res := raw("LS", `{"PATH":"`+l.keys+`"}`); !res.IsError || strings.Contains(res.Flatten(), "jwt.key") {
+		t.Errorf("LS PATH: want a refusal, got %q", res.Flatten())
+	}
+	if res := raw("Grep", `{"pattern":"SECRET","Path":"`+l.keys+`","output_mode":"content"}`); !res.IsError || strings.Contains(res.Flatten(), "SECRET") {
+		t.Errorf("Grep Path: want a refusal, got %q", res.Flatten())
+	}
+	// Numbers survive the rewrite as written.
+	wantOK(t, "Read with offset", raw("Read", `{"file_path":"notes.txt","offset":1,"limit":5}`), "run notes")
+}
