@@ -189,3 +189,99 @@ func contains(cs []Candidate, cve string) bool {
 	}
 	return false
 }
+
+func TestCorrelateSeriesOrRangeIsNotAVersion(t *testing.T) {
+	src := MapSource{
+		"exim":     {{CVE: "CVE-EXIM", Product: Product{Vendor: "exim", Product: "exim"}, EndExcluding: "4.94.1"}},
+		"python":   {{CVE: "CVE-PY", Product: Product{Vendor: "python", Product: "python"}, EndExcluding: "3.7.17"}},
+		"activemq": {{CVE: "CVE-MQ", Product: Product{Vendor: "apache", Product: "activemq"}, EndExcluding: "5.15.16"}},
+	}
+	// nmap: v/4.X/ cpe:/a:exim:exim:4 ; v/3.11 or later/ cpe:/a:python:python:3 ;
+	// v/5.12.0 - 5.15.4/ cpe:/a:apache:activemq:5. The CPE's truncated series is
+	// not a version either.
+	for _, obs := range []Observation{
+		{CPEs: []string{"cpe:/a:exim:exim:4"}, Version: "4.X"},
+		{CPEs: []string{"cpe:/a:python:python:3"}, Version: "3.11 or later"},
+		{CPEs: []string{"cpe:/a:apache:activemq:5"}, Version: "5.12.0 - 5.15.4"},
+	} {
+		if got := CorrelateResult(obs, src); len(got.Confirmed()) != 0 || got.Version != "" {
+			t.Errorf("%+v: version %q confirmed %v", obs, got.Version, ids(got.Confirmed()))
+		}
+	}
+	// The same CPE with a real banner version still matches.
+	if got := Correlate(Observation{CPEs: []string{"cpe:/a:exim:exim:4.92"}, Version: "4.92"}, src); len(got) != 1 {
+		t.Errorf("exim 4.92: %v", ids(got))
+	}
+}
+
+func TestCorrelateTruncatedCPEUsesBannerVersion(t *testing.T) {
+	src := MapSource{"postgresql": {{CVE: "CVE-PG", Product: Product{Vendor: "postgresql", Product: "postgresql"},
+		StartIncluding: "13.0", EndExcluding: "13.3"}}}
+	res := CorrelateResult(Observation{CPEs: []string{"cpe:/a:postgresql:postgresql:13"}, Version: "13.2"}, src)
+	if res.Version != "13.2" || len(res.Confirmed()) != 1 {
+		t.Fatalf("version %q confirmed %v", res.Version, ids(res.Confirmed()))
+	}
+}
+
+func TestCorrelateEachCPEKeepsItsVersion(t *testing.T) {
+	// nmap BaseHTTPServer: cpe:/a:python:basehttpserver:0.6 then cpe:/a:python:python:3.12.3.
+	src := MapSource{"python": {{CVE: "CVE-PY", Product: Product{Vendor: "python", Product: "python"}, EndExcluding: "3.7.17"}}}
+	res := CorrelateResult(Observation{
+		CPEs: []string{"cpe:/a:python:basehttpserver:0.6", "cpe:/a:python:python:3.12.3"}, Product: "BaseHTTPServer", Version: "0.6",
+	}, src)
+	if len(res.Confirmed()) != 0 {
+		t.Fatalf("python was checked with another product's version: %+v", res.Confirmed())
+	}
+	res = CorrelateResult(Observation{CPEs: []string{"cpe:/a:python:basehttpserver:0.6", "cpe:/a:python:python:3.7.1"}}, src)
+	if c := res.Confirmed(); len(c) != 1 || c[0].Version != "3.7.1" {
+		t.Fatalf("python 3.7.1: %+v", c)
+	}
+}
+
+func TestCorrelateMySQLBuildSuffix(t *testing.T) {
+	src := MapSource{"mysql": {{CVE: "CVE-MY", Product: Product{Vendor: "oracle", Product: "mysql"},
+		StartIncluding: "8.0.0", EndIncluding: "8.0.35"}}}
+	res := CorrelateResult(Observation{CPEs: []string{"cpe:/a:mysql:mysql:8.0.35-0ubuntu0.22.04.1"}, Product: "MySQL",
+		Version: "8.0.35-0ubuntu0.22.04.1"}, src)
+	c := res.Confirmed()
+	if len(c) != 1 || c[0].Version != "8.0.35" || !c[0].BackportRisk {
+		t.Fatalf("mysql: %+v (distro %q)", c, res.Distro)
+	}
+}
+
+func TestCorrelatePlatformRestriction(t *testing.T) {
+	src := MapSource{"php": {
+		{CVE: "CVE-WIN", Product: Product{Vendor: "php", Product: "php"}, Score: 9.8, StartIncluding: "8.1.0", EndExcluding: "8.1.29", Platforms: PlatformWindows},
+		{CVE: "CVE-ANY", Product: Product{Vendor: "php", Product: "php"}, Score: 5.0, StartIncluding: "8.1.0", EndExcluding: "8.1.29"},
+	}}
+	// On a Linux host the Windows-only CVE is not a candidate.
+	got := Correlate(Observation{Product: "PHP", Version: "8.1.2", Extra: "Apache/2.4.52 (Ubuntu)"}, src)
+	if contains(got, "CVE-WIN") || !contains(got, "CVE-ANY") {
+		t.Errorf("linux host: %v", ids(got))
+	}
+	// On an unknown OS it is kept, marked conditional, and ranked after the
+	// unconditional candidate despite its higher score.
+	got = Correlate(Observation{Product: "PHP", Version: "8.1.2"}, src)
+	if len(got) != 2 || got[0].CVE != "CVE-ANY" || got[1].CVE != "CVE-WIN" || got[1].Platforms != PlatformWindows {
+		t.Errorf("unknown os: %+v", got)
+	}
+	// On Windows it applies unconditionally.
+	got = Correlate(Observation{Product: "PHP", Version: "8.1.2", Extra: "Microsoft-IIS/10.0"}, src)
+	if len(got) != 2 || got[0].CVE != "CVE-WIN" || got[0].Platforms != 0 {
+		t.Errorf("windows host: %+v", got)
+	}
+}
+
+func TestCorrelateOpenSSHPortableOnInclusiveBound(t *testing.T) {
+	src := MapSource{"openssh": {{CVE: "CVE-LE79", Product: ssh, EndIncluding: "7.9"}}}
+	for v, want := range map[string]bool{"7.9p1": true, "7.9p2": true, "7.9": true, "7.8p1": true, "8.0p1": false} {
+		if got := len(Correlate(Observation{CPEs: []string{"cpe:/a:openbsd:openssh:" + v}}, src)) == 1; got != want {
+			t.Errorf("openssh %s <= 7.9: %v, want %v", v, got, want)
+		}
+	}
+	// The rule is OpenSSH's: elsewhere a "p" release is a later patch level.
+	other := MapSource{"x": {{CVE: "CVE-X", Product: Product{Vendor: "v", Product: "x"}, EndIncluding: "7.9"}}}
+	if got := Correlate(Observation{CPEs: []string{"cpe:/a:v:x:7.9p1"}}, other); len(got) != 0 {
+		t.Errorf("non-openssh 7.9p1 <= 7.9 matched: %v", ids(got))
+	}
+}

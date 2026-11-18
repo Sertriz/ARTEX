@@ -69,20 +69,25 @@ func TestNormalizeProductName(t *testing.T) {
 
 func TestNormalizeVersion(t *testing.T) {
 	cases := map[string]string{
-		"8.2p1 Ubuntu 4ubuntu0.5": "8.2p1",
-		"2.4.41 (Ubuntu)":         "2.4.41",
-		"v5.30.0":                 "5.30.0",
-		"1.18.0":                  "1.18.0",
-		"  9.6p1  ":               "9.6p1",
-		"1.0.2k-fips":             "1.0.2k-fips",
-		"unknown":                 "",
-		"":                        "",
-		"-":                       "",
-		"5.5.5-10.3.39-MariaDB":   "5.5.5-10.3.39-mariadb", // the MariaDB prefix is stripped in Correlate
-		"10.3.23 or earlier":      "",
-		"2.4.X":                   "",
-		"5.*":                     "",
-		"1.0.2x":                  "1.0.2x",
+		"8.2p1 Ubuntu 4ubuntu0.5":          "8.2p1",
+		"2.4.41 (Ubuntu)":                  "2.4.41",
+		"v5.30.0":                          "5.30.0",
+		"1.18.0":                           "1.18.0",
+		"  9.6p1  ":                        "9.6p1",
+		"1.0.2k-fips":                      "1.0.2k-fips",
+		"unknown":                          "",
+		"":                                 "",
+		"-":                                "",
+		"5.5.5-10.3.39-MariaDB":            "5.5.5-10.3.39-mariadb", // the MariaDB prefix is stripped in Correlate
+		"10.3.23 or earlier":               "",
+		"3.11 or later":                    "",
+		"9.6.20 - 9.6.23 or 11.14 - 11.18": "",
+		"1.6.0 - 1.9.0":                    "",
+		"2.3.2 - 4.1.0":                    "",
+		"5.12.0 - 5.15.4":                  "",
+		"2.4.X":                            "",
+		"5.*":                              "",
+		"1.0.2x":                           "1.0.2x",
 	}
 	for in, want := range cases {
 		if got := NormalizeVersion(in); got != want {
@@ -157,5 +162,74 @@ func TestAliasKey(t *testing.T) {
 		if got := aliasKey(in); got != want {
 			t.Errorf("aliasKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestStripPortable(t *testing.T) {
+	cases := map[string]string{"7.9p1": "7.9", "9.6p12": "9.6", "7.9": "7.9", "1.0.2p": "1.0.2p", "p1": "p1"}
+	for in, want := range cases {
+		if got := stripPortable(in); got != want {
+			t.Errorf("stripPortable(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestProductVersion(t *testing.T) {
+	mysql := Product{Vendor: "oracle", Product: "mysql"}
+	cases := []struct {
+		p    Product
+		in   string
+		want string
+	}{
+		{mysql, "8.0.35-0ubuntu0.22.04.1", "8.0.35"},
+		{mysql, "5.7.33-log", "5.7.33"},
+		{Product{Vendor: "mysql", Product: "mysql"}, "8.0.35-27", "8.0.35"},
+		{mysql, "8.0.35", "8.0.35"},
+		{Product{Vendor: "mariadb", Product: "mariadb"}, "5.5.5-10.3.39", "10.3.39"},
+		{Product{Vendor: "mariadb", Product: "mariadb"}, "5.5.5-10.3.39-mariadb", "10.3.39"},
+		{Product{Vendor: "x", Product: "y"}, "1.0-rc1", "1.0-rc1"}, // a dash means something elsewhere
+	}
+	for _, c := range cases {
+		if got := productVersion(c.p, c.in); got != c.want {
+			t.Errorf("productVersion(%v, %q) = %q, want %q", c.p, c.in, got, c.want)
+		}
+	}
+}
+
+func TestPlatforms(t *testing.T) {
+	cpe := func(s string) CPE { c, _ := ParseCPEName(s); return c }
+	if got := platformOf(cpe("cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*")); got != PlatformWindows {
+		t.Errorf("windows = %v", got)
+	}
+	if got := platformOf(cpe("cpe:2.3:o:canonical:ubuntu_linux:22.04:*:*:*:*:*:*:*")); got != PlatformLinux {
+		t.Errorf("ubuntu = %v", got)
+	}
+	if got := platformOf(cpe("cpe:2.3:h:cisco:asa_5505:-:*:*:*:*:*:*:*")); got != PlatformOther {
+		t.Errorf("cisco = %v", got)
+	}
+	cases := []struct {
+		name   string
+		cpes   []CPE
+		distro string
+		texts  []string
+		want   PlatformSet
+	}{
+		{"os cpe", []CPE{cpe("cpe:/o:microsoft:windows")}, "", nil, PlatformWindows},
+		{"distro", nil, "ubuntu", nil, PlatformLinux},
+		{"freebsd", nil, "freebsd", nil, PlatformBSD},
+		{"iis header", nil, "", []string{"Microsoft-IIS/10.0"}, PlatformWindows},
+		{"unix comment", nil, "", []string{"Apache/2.4.49 (Unix)"}, platformUnix},
+		{"unknown", nil, "", []string{"nginx/1.18.0"}, 0},
+	}
+	for _, c := range cases {
+		if got := observedPlatform(c.cpes, c.distro, c.texts...); got != c.want {
+			t.Errorf("%s: observedPlatform = %v, want %v", c.name, got, c.want)
+		}
+	}
+	if !contradicts(PlatformWindows, PlatformLinux) || !contradicts(PlatformWindows, platformUnix) {
+		t.Error("a Windows-only record must not apply to a Linux/Unix host")
+	}
+	if contradicts(PlatformWindows, 0) || contradicts(0, PlatformLinux) || contradicts(PlatformWindows|PlatformOther, PlatformLinux) || contradicts(PlatformWindows, PlatformWindows) {
+		t.Error("unknown, unrestricted, other-platform and matching cases must not contradict")
 	}
 }

@@ -137,7 +137,7 @@ func TestFullThenIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatalf("full sync: %v", err)
 	}
-	if st.Mode != "full" || st.Requests != 2 || st.Received != 4 || st.Written != 3 || st.Files != 2 {
+	if st.Mode != "full" || st.Requests != 2 || st.Received != 4 || st.Written != 3 || st.Removed != 1 || st.Files != 3 {
 		t.Fatalf("full stats %+v", st)
 	}
 	if len(sleeps) != 1 || sleeps[0] != delayWithKey {
@@ -170,8 +170,10 @@ func TestFullThenIncremental(t *testing.T) {
 		strings.Contains(string(b), "linux_kernel") || strings.Contains(string(b), "MEDIUM") || strings.Contains(string(b), "matchCriteriaId") {
 		t.Errorf("trimmed record = %s", b)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "nvd-2023.jsonl")); !errors.Is(err, os.ErrNotExist) {
-		t.Error("a year holding only a rejected record must not get a file")
+	// A rejected record leaves a tombstone, so another copy of it in the
+	// directory (a seeded mirror) cannot keep it alive.
+	if tomb := readLines(t, filepath.Join(dir, "nvd-2023.jsonl")); len(tomb) != 1 || tomb[0]["vulnStatus"] != "Rejected" || tomb[0]["configurations"] != nil {
+		t.Errorf("tombstone = %v", tomb)
 	}
 	stt, _ := ReadState(dir)
 	if !stt.LastModEnd.Equal(t0) || !stt.LastFull.Equal(t0) {
@@ -183,7 +185,7 @@ func TestFullThenIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := src.Stats(); s.CVEs != 3 || s.ErrorFiles != 0 {
+	if s := src.Stats(); s.CVEs != 3 || s.Rejected != 1 || s.ErrorFiles != 0 {
 		t.Fatalf("loaded stats %+v", s)
 	}
 	got := cvematch.CorrelateResult(cvematch.Observation{CPEs: []string{"cpe:/a:openbsd:openssh:8.2p1"}}, src)
@@ -215,7 +217,7 @@ func TestFullThenIncremental(t *testing.T) {
 		t.Errorf("windows %v / %v", w1, w2)
 	}
 	lines = readLines(t, filepath.Join(dir, "nvd-2021.jsonl"))
-	if len(lines) != 1 || lines[0]["vulnStatus"] != "Modified" {
+	if len(lines) != 2 || lines[0]["vulnStatus"] != "Modified" || lines[1]["vulnStatus"] != "Rejected" {
 		t.Fatalf("2021 after merge = %v", lines)
 	}
 	if lines = readLines(t, filepath.Join(dir, "nvd-2025.jsonl")); len(lines) != 1 {
@@ -352,5 +354,154 @@ func TestSlimRejectsBadID(t *testing.T) {
 func TestNVDTime(t *testing.T) {
 	if got := nvdTime(time.Date(2024, 1, 2, 3, 4, 5, 6e6, time.FixedZone("x", 3600))); got != "2024-01-02T02:04:05.006+00:00" {
 		t.Errorf("nvdTime = %q", got)
+	}
+}
+
+func TestSyncSurvivesUnreadableState(t *testing.T) {
+	nvd := &fakeNVD{perPage: 5, records: []map[string]any{rec("CVE-2021-0001", "", "Analyzed", "1", "2")}}
+	srv := httptest.NewServer(nvd)
+	defer srv.Close()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, stateName), nil, 0o600); err != nil { // empty: not JSON
+		t.Fatal(err)
+	}
+	var sleeps []time.Duration
+	st, err := Sync(context.Background(), options(t, srv, dir, &clock{t: time.Unix(1e9, 0)}, &sleeps))
+	if err != nil || st.Mode != "full" {
+		t.Fatalf("sync with a damaged state: %+v %v", st, err)
+	}
+	if s, err := ReadState(dir); err != nil || s.LastModEnd.IsZero() {
+		t.Fatalf("state not rewritten: %+v %v", s, err)
+	}
+}
+
+// shrinkingNVD serves a window whose result set shrinks after the first page:
+// the record at index 0 is modified again and leaves the window.
+type shrinkingNVD struct {
+	mu       sync.Mutex
+	records  []map[string]any
+	calls    int
+	shrinkAt int // the call after which the first record leaves the set; 0 = never
+	always   bool
+}
+
+func (f *shrinkingNVD) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	recs := f.records
+	if f.shrinkAt > 0 && f.calls > f.shrinkAt && (f.always || f.calls == f.shrinkAt+1) {
+		recs = recs[1:]
+	}
+	start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
+	end := min(start+2, len(recs))
+	var vulns []any
+	for _, rr := range recs[min(start, len(recs)):end] {
+		vulns = append(vulns, map[string]any{"cve": rr})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"startIndex": start, "totalResults": len(recs), "vulnerabilities": vulns})
+}
+
+func TestIncrementalRereadsAShrinkingWindow(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeState(dir, State{LastModEnd: time.Unix(1e9, 0).UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	var recs []map[string]any
+	for i := 1; i <= 5; i++ {
+		recs = append(recs, rec(fmt.Sprintf("CVE-2024-000%d", i), "2025-01-01T00:00:00.000", "Modified", "1", "2"))
+	}
+	nvd := &shrinkingNVD{records: recs, shrinkAt: 1}
+	srv := httptest.NewServer(nvd)
+	defer srv.Close()
+	var sleeps []time.Duration
+	o := options(t, srv, dir, &clock{t: time.Unix(1e9, 0).Add(time.Hour)}, &sleeps)
+	if _, err := Sync(context.Background(), o); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	// Every record, including the one a naive pager would skip after the shift.
+	lines := readLines(t, filepath.Join(dir, "nvd-2024.jsonl"))
+	if len(lines) != 5 {
+		t.Fatalf("got %d records, want 5 (a record was skipped when the window shrank)", len(lines))
+	}
+}
+
+func TestPersistentShrinkFailsWithoutMovingState(t *testing.T) {
+	dir := t.TempDir()
+	before := State{LastModEnd: time.Unix(1e9, 0).UTC()}
+	if err := writeState(dir, before); err != nil {
+		t.Fatal(err)
+	}
+	var recs []map[string]any
+	for i := 1; i <= 5; i++ {
+		recs = append(recs, rec(fmt.Sprintf("CVE-2024-000%d", i), "2025-01-01T00:00:00.000", "Modified", "1", "2"))
+	}
+	// Each pass: the first page sees 5, the rest 4.
+	nvd := &shrinkingTwice{inner: &shrinkingNVD{records: recs}}
+	srv := httptest.NewServer(nvd)
+	defer srv.Close()
+	var sleeps []time.Duration
+	o := options(t, srv, dir, &clock{t: time.Unix(1e9, 0).Add(time.Hour)}, &sleeps)
+	if _, err := Sync(context.Background(), o); !errors.Is(err, errShrank) {
+		t.Fatalf("err = %v, want errShrank", err)
+	}
+	if after, _ := ReadState(dir); !after.LastModEnd.Equal(before.LastModEnd) {
+		t.Error("a failed sync moved the state forward")
+	}
+}
+
+// shrinkingTwice shrinks within every pass: page one reports all records, later
+// pages one fewer.
+type shrinkingTwice struct{ inner *shrinkingNVD }
+
+func (s *shrinkingTwice) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	recs := s.inner.records
+	start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
+	if start > 0 {
+		recs = recs[1:]
+	}
+	end := min(start+2, len(recs))
+	var vulns []any
+	for _, rr := range recs[min(start, len(recs)):end] {
+		vulns = append(vulns, map[string]any{"cve": rr})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"startIndex": start, "totalResults": len(recs), "vulnerabilities": vulns})
+}
+
+func TestSlimKeepsPlatformOfAndConfigurations(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"id": "CVE-2024-4577", "lastModified": "2025-01-01T00:00:00.000", "vulnStatus": "Analyzed",
+		"configurations": []any{map[string]any{"operator": "AND", "nodes": []any{
+			map[string]any{"operator": "OR", "cpeMatch": []any{map[string]any{"vulnerable": true, "criteria": "cpe:2.3:a:php:php:*:*:*:*:*:*:*:*", "versionStartIncluding": "8.1.0", "versionEndExcluding": "8.1.29"}}},
+			map[string]any{"operator": "OR", "cpeMatch": []any{map[string]any{"vulnerable": false, "criteria": "cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*"}}},
+		}}},
+	})
+	_, line, err := slim(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := cvematch.LoadNVDReader(strings.NewReader(string(line)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := src.Lookup(cvematch.Product{Vendor: "php", Product: "php"})
+	if len(es) != 1 || es[0].Platforms != cvematch.PlatformWindows {
+		t.Fatalf("platform lost in the trimmed record: %s -> %+v", line, es)
+	}
+}
+
+func TestLockHeartbeatKeepsItFresh(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := lock(dir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	// A fresh lock blocks; a dead one (not touched for staleLock) is taken over.
+	if _, err := lock(dir, time.Now()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("live lock: %v", err)
+	}
+	if _, err := lock(dir, time.Now().Add(staleLock+time.Minute)); err != nil {
+		t.Fatalf("a lock idle past staleLock must be taken over: %v", err)
 	}
 }

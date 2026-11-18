@@ -285,10 +285,12 @@ worker remains confined to the intent it claimed.
 - **CVE leads for exposed services (opt-in)**: with a local NVD feed configured, every versioned
   service an `nmap -sV` or `httpx` ingest reveals is matched against known CVEs, and each distinct
   software version with candidates becomes one unverified lead for the planner to confirm (for
-  example `CVE lead (unverified): openbsd:openssh 8.2p1 on 10.0.0.5:22/tcp +3 more — CVE-2023-38408,
-  …; ubuntu build, fixes may be backported`). Matching follows real NVD conventions, maps scanner
-  names to NVD's through a verified alias table, and flags distribution builds whose packages may
-  carry the fix. A lead is never a finding. See [CVE correlation](docs/cve-correlation-design.md).
+  example `CVE lead (unverified): openbsd:openssh 8.2p1 — CVE-2023-38408, CVE-2021-41617 +1 (1
+  critical, 1 high); ubuntu build, fixes may be backported; on 10.0.0.5:22/tcp +3 more`). Matching
+  follows real NVD conventions, maps scanner names to NVD's through a verified alias table, drops
+  CVEs NVD limits to another platform (a Windows-only bug on a Linux host), and flags distribution
+  builds whose packages may carry the fix. A lead is never a finding. See
+  [CVE correlation](docs/cve-correlation-design.md).
 - **Task categories, templates, relations and archives** for repeatable engagements.
 
 ### Platform

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"os"
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
@@ -17,5 +19,18 @@ func TestShutdownContextPreservesNamedCause(t *testing.T) {
 	<-ctx.Done()
 	if code, _, _, ok := agent.AbortReason(ctx); !ok || code != "shutdown" {
 		t.Fatalf("code=%q ok=%v, want shutdown", code, ok)
+	}
+}
+
+// -cve-sync-full alone must run the CVE command, never fall through to starting
+// a second server next to the running one.
+func TestCVESyncFullAloneRunsTheCommand(t *testing.T) {
+	oldArgs, oldFlags := os.Args, flag.CommandLine
+	t.Cleanup(func() { os.Args, flag.CommandLine = oldArgs, oldFlags })
+	flag.CommandLine = flag.NewFlagSet("artex", flag.ContinueOnError)
+	os.Args = []string{"artex", "-cve-sync-full"}
+	t.Setenv("ARTEX_CVE_FEED_DIR", "") // no feed: the command exits 2 at once
+	if code := run(); code != 2 {
+		t.Fatalf("run() = %d, want 2 from the CVE command", code)
 	}
 }

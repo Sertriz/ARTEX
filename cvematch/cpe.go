@@ -167,9 +167,11 @@ var versionDigitRe = regexp.MustCompile(`[0-9]`)
 // version that cannot be ordered must not place anything inside a range.
 func NormalizeVersion(raw string) string {
 	v := strings.ToLower(strings.TrimSpace(raw))
-	// nmap prints a bound when it cannot read the version ("10.3.23 or earlier"):
-	// that is not a version and must not be placed inside a range.
-	if strings.Contains(v, " or earlier") || strings.Contains(v, " or later") {
+	// nmap prints a bound, a range or alternatives when it cannot pin the version
+	// ("10.3.23 or earlier", "1.6.0 - 1.9.0", "9.6.20 - 9.6.23 or 11.14 - 11.18"):
+	// none is a version, and placing its first number inside a range would claim a
+	// match nmap never saw.
+	if strings.Contains(v, " or ") || versionRangeRe.MatchString(v) {
 		return ""
 	}
 	if i := strings.IndexAny(v, " \t(,;"); i >= 0 {
@@ -188,6 +190,123 @@ func NormalizeVersion(raw string) string {
 // versionWildcardRe matches a version with a wildcard component ("2.4.x", "5.*"),
 // which names a series, not a version.
 var versionWildcardRe = regexp.MustCompile(`(^|[.\-])(x|\*)($|[.\-])`)
+
+// versionRangeRe matches nmap's "A - B" version ranges.
+var versionRangeRe = regexp.MustCompile(`[0-9a-z]\S*\s+-\s+[0-9]`)
+
+// portableSuffixRe matches an OpenSSH portable release suffix ("9.6p1").
+var portableSuffixRe = regexp.MustCompile(`^(.*[0-9])p[0-9]+$`)
+
+// stripPortable returns an OpenSSH portable version without its "p<n>" suffix
+// ("7.9p1" -> "7.9"), or v unchanged.
+func stripPortable(v string) string {
+	if m := portableSuffixRe.FindStringSubmatch(v); m != nil {
+		return m[1]
+	}
+	return v
+}
+
+// mysqlUpstreamRe is the upstream X.Y.Z of a MySQL server version string, which
+// distributions and the server itself extend ("8.0.35-0ubuntu0.22.04.1",
+// "5.7.33-log", Percona "8.0.35-27").
+var mysqlUpstreamRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
+
+// productVersion applies the product-specific version conventions NVD's records
+// assume: MariaDB's "5.5.5-" handshake prefix is dropped, and a MySQL server
+// version is reduced to its upstream release (the build suffix would otherwise
+// sort above the release and fall outside Oracle's inclusive bounds).
+func productVersion(p Product, v string) string {
+	switch {
+	case p.Product == "mariadb" && strings.HasPrefix(v, mariadbCompatPrefix):
+		return NormalizeVersion(strings.TrimSuffix(strings.TrimPrefix(v, mariadbCompatPrefix), "-mariadb"))
+	case p.Vendor == "mysql" || (p.Vendor == "oracle" && strings.HasPrefix(p.Product, "mysql")):
+		if m := mysqlUpstreamRe.FindString(v); m != "" && len(m) < len(v) && v[len(m)] == '-' {
+			return m
+		}
+	}
+	return v
+}
+
+// PlatformSet is a set of operating-system families a CVE record is limited to
+// (NVD's "running on" AND configurations), or that an observation runs on.
+type PlatformSet uint8
+
+// Platform families.
+const (
+	PlatformWindows PlatformSet = 1 << iota
+	PlatformLinux
+	PlatformApple
+	PlatformBSD
+	PlatformOther // a platform outside the families above: never contradicted
+)
+
+// platformUnix is what a generic "Unix" says: some non-Windows system.
+const platformUnix = PlatformLinux | PlatformApple | PlatformBSD
+
+// Names lists the families in the set.
+func (s PlatformSet) Names() []string {
+	var out []string
+	for _, f := range []struct {
+		bit  PlatformSet
+		name string
+	}{{PlatformWindows, "windows"}, {PlatformLinux, "linux"}, {PlatformApple, "apple"}, {PlatformBSD, "bsd"}, {PlatformOther, "other"}} {
+		if s&f.bit != 0 {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
+// platformOf maps a platform CPE to its family.
+func platformOf(c CPE) PlatformSet {
+	switch {
+	case c.Vendor == "microsoft" && strings.HasPrefix(c.Product, "windows"):
+		return PlatformWindows
+	case strings.Contains(c.Product, "linux") || c.Product == "fedora" || c.Vendor == "suse" || c.Vendor == "opensuse":
+		return PlatformLinux
+	case c.Vendor == "apple" && (c.Product == "mac_os_x" || c.Product == "macos" || c.Product == "iphone_os" || c.Product == "ipados"):
+		return PlatformApple
+	case c.Product == "freebsd" || c.Product == "openbsd" || c.Product == "netbsd":
+		return PlatformBSD
+	}
+	return PlatformOther
+}
+
+var (
+	windowsTextRe = regexp.MustCompile(`windows|win32|win64|microsoft-iis|\biis\b`)
+	unixTextRe    = regexp.MustCompile(`\bunix\b|linux`)
+)
+
+// observedPlatform derives the OS family a service runs on from its OS CPEs, the
+// detected distribution and its banner text; 0 when nothing says.
+func observedPlatform(osCPEs []CPE, distro string, texts ...string) PlatformSet {
+	for _, c := range osCPEs {
+		if f := platformOf(c); f != PlatformOther {
+			return f
+		}
+	}
+	switch distro {
+	case "":
+	case "freebsd":
+		return PlatformBSD
+	default:
+		return PlatformLinux
+	}
+	all := strings.ToLower(strings.Join(texts, " "))
+	switch {
+	case windowsTextRe.MatchString(all):
+		return PlatformWindows
+	case unixTextRe.MatchString(all):
+		return platformUnix
+	}
+	return 0
+}
+
+// contradicts reports whether a record limited to the platforms in rec cannot
+// apply to a service observed on obs.
+func contradicts(rec, obs PlatformSet) bool {
+	return rec != 0 && obs != 0 && rec&PlatformOther == 0 && rec&obs == 0
+}
 
 // mariadbCompatPrefix is the "5.5.5-" MariaDB puts before its real version in the
 // MySQL handshake for old-client compatibility ("5.5.5-10.3.39-MariaDB").

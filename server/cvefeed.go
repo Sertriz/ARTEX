@@ -48,9 +48,10 @@ type cveFeed struct {
 	active    bool
 	syncing   bool
 	syncStart time.Time
-	lastSync  *nvdsync.Stats
-	syncAt    time.Time
-	syncErr   string
+	lastSync  *nvdsync.Stats // the last successful sync
+	syncAt    time.Time      // when lastSync finished
+	attemptAt time.Time      // when the last sync attempt, successful or not, finished
+	syncErr   string         // the last attempt's error, "" when it succeeded
 
 	// seams for tests
 	syncFn  func(context.Context, nvdsync.Options) (nvdsync.Stats, error)
@@ -136,18 +137,22 @@ func (f *cveFeed) runSync(ctx context.Context, full bool) {
 		Dir: f.dir, APIKey: f.apiKey, Full: full,
 		Logf: func(format string, args ...any) { log.Printf(format, args...) },
 	})
-	f.mu.Lock()
-	f.syncing, f.syncAt = false, f.now()
 	if err != nil {
-		f.syncErr = err.Error()
 		log.Printf("[cve] sync failed: %v", err)
 	} else {
-		f.syncErr, f.lastSync = "", &st
-	}
-	f.mu.Unlock()
-	if err == nil {
+		// The sync stays "running" until the synced feed is loaded, so the status
+		// never shows a finished sync next to the feed it replaced.
 		_ = f.reload()
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	f.syncing, f.attemptAt = false, now
+	if err != nil {
+		f.syncErr = err.Error()
+		return
+	}
+	f.syncErr, f.lastSync, f.syncAt = "", &st, now
 }
 
 // autoSync syncs every interval until ctx ends. The first sync runs shortly after
@@ -196,7 +201,8 @@ func (f *cveFeed) status() map[string]any {
 	defer f.mu.Unlock()
 	syncInfo := map[string]any{
 		"running": f.syncing, "started_at": nil, "last": f.lastSync, "last_at": timeOrNil(f.syncAt),
-		"last_error": f.syncErr, "interval": "", "api_key_configured": f.apiKey != "",
+		"last_error": f.syncErr, "last_attempt_at": timeOrNil(f.attemptAt),
+		"interval": "", "api_key_configured": f.apiKey != "",
 	}
 	if f.syncing {
 		syncInfo["started_at"] = timeOrNil(f.syncStart)
