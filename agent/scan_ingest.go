@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/cvematch"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -39,6 +40,10 @@ type scanIngest struct {
 	Assets                                     []assetInputItem
 	Facts                                      []factItem
 	Notable                                    map[string][]string
+	// Services are the version/CPE-bearing services seen in this file, for CVE
+	// correlation. The parser only collects them; correlation runs in the tool,
+	// which holds the CVE source. Empty when nothing carried a product or CPE.
+	Services []cveServiceObs
 }
 
 func newScanIngest() *scanIngest {
@@ -214,6 +219,20 @@ func nmapWebScheme(name, tunnel string) string {
 	return ""
 }
 
+// addServiceObs records a service for CVE correlation when it carries something to
+// match on (a product name or a CPE). Version may be empty — the correlator then
+// keeps only "all versions" entries. The descriptor is inert fact-detail text.
+func (s *scanIngest) addServiceObs(ip, portProto, serviceName, product, version string, cpes []string) {
+	if strings.TrimSpace(product) == "" && len(cpes) == 0 {
+		return
+	}
+	desc := strings.TrimSpace(fmt.Sprintf("%s %s %s %s %s", ip, portProto, serviceName, product, version))
+	s.Services = append(s.Services, cveServiceObs{
+		Desc: desc,
+		Obs:  cvematch.Observation{CPEs: cpes, Product: product, Version: version},
+	})
+}
+
 func (s *scanIngest) addNmapHost(h nmapHost) {
 	if h.Status.State != "up" || s.full() {
 		return
@@ -258,6 +277,7 @@ func (s *scanIngest) addNmapHost(h nmapHost) {
 		ports = append(ports, map[string]any{"port": pp, "service": p.Svc.Name, "product": p.Svc.Product,
 			"version": p.Svc.Version, "tunnel": p.Svc.Tunnel, "cpe": p.Svc.CPE})
 		s.note("ports", ip+" "+pp+" "+name)
+		s.addServiceObs(ip, pp, name, p.Svc.Product, p.Svc.Version, p.Svc.CPE)
 		if scheme := nmapWebScheme(name, p.Svc.Tunnel); scheme != "" && p.Proto == "tcp" {
 			u := scheme + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
 			s.urls[u] = true
