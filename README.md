@@ -282,6 +282,15 @@ worker remains confined to the intent it claimed.
   - Import: rows are merged by company asset scope and become part of the asset graph.
 
   </details>
+- **CVE leads for exposed services (opt-in)**: with a local NVD feed configured, every versioned
+  service an `nmap -sV` or `httpx` ingest reveals is matched against known CVEs, and each distinct
+  software version with candidates becomes one unverified lead for the planner to confirm (for
+  example `CVE lead (unverified): openbsd:openssh 8.2p1 — CVE-2023-38408, CVE-2021-41617 +1 (1
+  critical, 1 high); ubuntu build, fixes may be backported; on 10.0.0.5:22/tcp +3 more`). Matching
+  follows real NVD conventions, maps scanner names to NVD's through a verified alias table, drops
+  CVEs NVD limits to another platform (a Windows-only bug on a Linux host), and flags distribution
+  builds whose packages may carry the fix. A lead is never a finding. See
+  [CVE correlation](docs/cve-correlation-design.md).
 - **Task categories, templates, relations and archives** for repeatable engagements.
 
 ### Platform
@@ -456,6 +465,17 @@ tokens, and 2 turns) the task enters a forced wrap-up: the planner writes a summ
 judgment, and workers may only write back. The task then ends `done` if its goals are met, else
 `timeout`. Practical floor: below 50,000 tokens no worker starts; 50,000-70,000 typically gives one
 worker then wrap-up; pick well above 70,000 for real exploration.
+
+**CVE correlation (off by default)**: set `ARTEX_CVE_FEED_DIR` to a directory for a local copy of
+the NVD CVE data (in Docker, under `/app/data`), then fill it with `artex -cve-sync` or the **CVE
+correlation feed** card in System settings (the first sync downloads every CVE: about 20 minutes, or
+a few minutes with `ARTEX_NVD_API_KEY`; later syncs fetch only changes). `ARTEX_CVE_SYNC_INTERVAL`
+(for example `24h`) keeps it fresh automatically; `artex -cve-check` reports what the directory
+holds. Air-gapped installs can drop NVD 2.0 JSON files (`.json`, `.jsonl`, optionally `.gz`) into
+the directory and reload. Once loaded, `ingest_scan_output` correlates nmap and httpx services and
+writes one unverified "CVE lead" fact per distinct software version. The whole NVD takes roughly
+350 MB of memory once loaded (up to ~900 MB while loading). Unset, nothing changes. Details:
+[docs/cve-correlation-design.md](docs/cve-correlation-design.md).
 
 **Common flags**: `./start.sh -addr :8787 -proxy :8788` (`-addr` frontend/API, `-proxy` traffic
 recording proxy).

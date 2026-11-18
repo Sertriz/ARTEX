@@ -50,6 +50,11 @@ services:
       ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
       ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
       ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
+      # CVE correlation (off by default): e.g. ARTEX_CVE_FEED_DIR=/app/data/cve-feed in .env, then
+      # sync it from System settings or `docker compose exec artex ./artex -cve-sync`. See README.
+      ARTEX_CVE_FEED_DIR: ${ARTEX_CVE_FEED_DIR:-}
+      ARTEX_NVD_API_KEY: ${ARTEX_NVD_API_KEY:-}
+      ARTEX_CVE_SYNC_INTERVAL: ${ARTEX_CVE_SYNC_INTERVAL:-}
     ports:
       - "${ARTEX_BIND_ADDR:-127.0.0.1}:8787:8787"
       - "127.0.0.1:8788:8788"

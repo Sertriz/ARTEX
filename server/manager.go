@@ -259,6 +259,7 @@ type Manager struct {
 	assets      *pgdb.AssetStore
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
+	cve         *cveFeed               // CVE correlation feed: load, reload, NVD sync
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
 
 	// Capture-proxy rewrite rules: rewriteMu serializes reloads, rewriteSet is
@@ -498,6 +499,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	// CVE correlation feed (ARTEX_CVE_FEED_DIR): off unless configured and loaded.
+	m.cve = newCVEFeedFromEnv()
+	if m.cve.enabled() {
+		_ = m.cve.reload()
+	}
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()

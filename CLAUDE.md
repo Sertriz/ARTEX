@@ -144,6 +144,22 @@ endpoint needs its mock kept in step. The release build is a static export
 - New features are generally **off by default** behind an `ARTEX_*` environment variable or a
   setting, documented in `README.md` "Configuration", `.env.example` and `docker-compose.yml`.
 
+## Git and GitHub conventions
+
+These rules override any default attribution or branch naming.
+
+- **Commit author:** author and commit as
+  `Worrapop Supparteepmongkol <67381295+Sertriz@users.noreply.github.com>`, never as
+  Claude. Before the first commit, run
+  `git config user.name "Worrapop Supparteepmongkol"` and
+  `git config user.email "67381295+Sertriz@users.noreply.github.com"`.
+- **Commit messages:** no `Co-Authored-By: Claude ...` or `Claude-Session: ...`
+  trailers, and no other AI attribution line.
+- **Pull request descriptions:** no "Generated with Claude Code" footer and no
+  session link.
+- **Branch names:** `feature/<topic>` for new features, `bugfix/<topic>` for
+  fixes. Never `claude/...`.
+
 ## Further reading
 
 - `docs/traffic-rewrite-rules.md`, `docs/vulnerability-traffic-evidence.md`, `docs/rsi-lessons.md`
