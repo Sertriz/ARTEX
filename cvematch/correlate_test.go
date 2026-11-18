@@ -285,3 +285,19 @@ func TestCorrelateOpenSSHPortableOnInclusiveBound(t *testing.T) {
 		t.Errorf("non-openssh 7.9p1 <= 7.9 matched: %v", ids(got))
 	}
 }
+
+func TestKeyCollapsesWhatCorrelationIgnores(t *testing.T) {
+	src := buildSource()
+	a := Observation{Product: "nginx", Version: "1.18.0", Extra: "nginx/1.18.0 jQuery:3.5.1 Bootstrap:4.6.0"}
+	b := Observation{Product: "Nginx", Version: "1.18.0", Extra: "nginx/1.18.0 React:18.2.0"}
+	if Key(a, src) != Key(b, src) {
+		t.Errorf("two sites running the same nginx got different keys:\n%s\n%s", Key(a, src), Key(b, src))
+	}
+	c := Observation{Product: "nginx", Version: "1.18.0", Extra: "nginx/1.18.0 (Ubuntu)"}
+	if Key(a, src) == Key(c, src) {
+		t.Error("a distro build must not share the key of an upstream build")
+	}
+	if Key(a, src) == Key(Observation{Product: "nginx", Version: "1.20.1"}, src) {
+		t.Error("different versions must not share a key")
+	}
+}

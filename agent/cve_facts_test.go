@@ -188,11 +188,12 @@ func TestCVEFactsBannerPaddedVersionStaysOutOfSummary(t *testing.T) {
 				t.Fatalf("banner words reached the summary/evidence:\n%s\n%s", f.Summary, f.Evidence)
 			}
 		}
-		if !strings.HasPrefix(f.Summary, "CVE lead (unverified): openbsd:openssh — ") || !strings.Contains(f.Evidence, "reported version ?") {
+		if !strings.HasPrefix(f.Summary, "CVE lead (unverified): openbsd:openssh — ") || !strings.Contains(f.Evidence, "not version-shaped") {
 			t.Errorf("summary %q evidence %q", f.Summary, f.Evidence)
 		}
 	}
-	for v, ok := range map[string]bool{"8.2p1": true, "1.0.1f": true, "2.4.49": true, "10.3.39": true, "8.2p1_x": false, "1.0-rc1": false, "": false} {
+	for v, ok := range map[string]bool{"8.2p1": true, "1.0.1f": true, "2.4.49": true, "10.3.39": true, "1.0.2k-fips": true, "9.11.4-p2": true,
+		"1.0-rc1": true, "8.2p1_x": false, "8.2p1-rce": false, "1.0-fips-approved": false, "": false} {
 		if cveVersionRe.MatchString(v) != ok {
 			t.Errorf("cveVersionRe(%q) = %v", v, !ok)
 		}
@@ -216,8 +217,10 @@ func TestCVEFactsHostileHostCannotCrowdOutOthers(t *testing.T) {
 	if !strings.Contains(summaries(facts), "CVE-2011-2523") {
 		t.Fatal("the other host's lead was crowded out")
 	}
-	if st.OverCap != cveFactsMax+50-cveGroupsPerHost {
-		t.Errorf("overcap = %d", st.OverCap)
+	// The host spends at most cveDistinctPerHost correlations; of the versions it
+	// produced, only its cveGroupsPerHost strongest are kept.
+	if st.Skipped != cveFactsMax+50-cveDistinctPerHost || st.OverCap != cveDistinctPerHost-cveGroupsPerHost || len(st.SkippedExamples) != cveSkippedExamples {
+		t.Errorf("stats %+v", st)
 	}
 }
 
@@ -291,6 +294,84 @@ func TestTargetHost(t *testing.T) {
 	for in, want := range cases {
 		if got := targetHost(in); got != want {
 			t.Errorf("targetHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCVEFactsHeterogeneousSweepIsNotSkipped(t *testing.T) {
+	// 500 sites, each with its own mix of technologies and Server comment, all
+	// running nginx 1.18.0: one correlation, one lead, nothing skipped.
+	src := cvematch.MapSource{"nginx": {{CVE: "CVE-2021-23017", Product: cvematch.Product{Vendor: "f5", Product: "nginx"},
+		Severity: "HIGH", Score: 7.7, StartIncluding: "0.6.18", EndExcluding: "1.20.1"}}}
+	var svcs []cveServiceObs
+	for i := 0; i < 500; i++ {
+		svcs = append(svcs, cveServiceObs{Target: fmt.Sprintf("https://site%d.example.com", i), Host: fmt.Sprintf("10.3.%d.%d", i/250, i%250),
+			Obs: cvematch.Observation{Product: "Nginx", Version: "1.18.0", Extra: fmt.Sprintf("nginx/1.18.0 jQuery:3.%d.0 site-%d", i%7, i)}})
+	}
+	facts, st := cveFactsFromServices(context.Background(), svcs, src, nil, "httpx-jsonl")
+	if len(facts) != 1 || st.Matched != 500 || st.Skipped != 0 {
+		t.Fatalf("facts=%d stats=%+v", len(facts), st)
+	}
+}
+
+func TestCVEFactsHostKeepsItsStrongestVersions(t *testing.T) {
+	// One legacy host with 21 vulnerable versions; the most critical comes last.
+	src := cvematch.MapSource{}
+	var svcs []cveServiceObs
+	for i := 0; i < cveGroupsPerHost+1; i++ {
+		prod := fmt.Sprintf("p%02d", i)
+		score := 4.0
+		if i == cveGroupsPerHost {
+			score = 9.8
+		}
+		src[prod] = []cvematch.Entry{{CVE: fmt.Sprintf("CVE-2020-%04d", 1000+i), Product: cvematch.Product{Vendor: "v", Product: prod}, Score: score, StartIncluding: "1"}}
+		svcs = append(svcs, cveServiceObs{Target: fmt.Sprintf("10.4.0.1:%d/tcp", 1000+i), Host: "10.4.0.1",
+			Obs: cvematch.Observation{CPEs: []string{"cpe:/a:v:" + prod + ":1.0"}}})
+	}
+	facts, st := cveFactsFromServices(context.Background(), svcs, src, nil, "nmap-xml")
+	if len(facts) != cveGroupsPerHost || st.OverCap != 1 || !strings.Contains(facts[0].Summary, fmt.Sprintf("CVE-2020-%04d", 1000+cveGroupsPerHost)) {
+		t.Fatalf("facts=%d overcap=%d first=%q", len(facts), st.OverCap, facts[0].Summary)
+	}
+}
+
+func TestCVEFactsVirtualHostsShareTheHostQuota(t *testing.T) {
+	// One server behind five names: one quota, keyed on its IP.
+	var svcs []cveServiceObs
+	for n := 0; n < 5; n++ {
+		for i := 0; i < cveGroupsPerHost; i++ {
+			svcs = append(svcs, cveServiceObs{Target: fmt.Sprintf("https://w%d.decoy.example.com", n), Host: "203.0.113.66",
+				Obs: cvematch.Observation{CPEs: []string{fmt.Sprintf("cpe:/a:openbsd:openssh:8.2p%d", n*cveGroupsPerHost+i)}}})
+		}
+	}
+	svcs = append(svcs, sshObs("198.51.100.21:22/tcp", 0, "9.6p1", ""))
+	facts, _ := cveFactsFromServices(context.Background(), svcs, sshSource(), nil, "httpx-jsonl")
+	if len(facts) != cveGroupsPerHost+1 || !strings.Contains(summaries(facts), "198.51.100.21") {
+		t.Fatalf("got %d facts:\n%s", len(facts), summaries(facts))
+	}
+}
+
+func TestCVEFactsOverCapCountsOnlyVersionsLeftOut(t *testing.T) {
+	src := cvematch.MapSource{}
+	var svcs []cveServiceObs
+	// Host A fills its quota with stronger versions, then runs V.
+	for i := 0; i < cveGroupsPerHost; i++ {
+		prod := fmt.Sprintf("p%02d", i)
+		src[prod] = []cvematch.Entry{{CVE: fmt.Sprintf("CVE-2021-%04d", 1000+i), Product: cvematch.Product{Vendor: "v", Product: prod}, Score: 9, StartIncluding: "1"}}
+		svcs = append(svcs, cveServiceObs{Target: fmt.Sprintf("10.5.0.1:%d/tcp", 1000+i), Host: "10.5.0.1",
+			Obs: cvematch.Observation{CPEs: []string{"cpe:/a:v:" + prod + ":1.0"}}})
+	}
+	src["vv"] = []cvematch.Entry{{CVE: "CVE-2021-9999", Product: cvematch.Product{Vendor: "v", Product: "vv"}, Score: 5, StartIncluding: "1"}}
+	v := cvematch.Observation{CPEs: []string{"cpe:/a:v:vv:1.0"}}
+	svcs = append(svcs, cveServiceObs{Target: "10.5.0.1:9999/tcp", Host: "10.5.0.1", Obs: v})
+	// Host B runs V too: V is written, anchored to both hosts.
+	svcs = append(svcs, cveServiceObs{Target: "10.5.0.2:9999/tcp", Host: "10.5.0.2", Obs: v})
+	facts, st := cveFactsFromServices(context.Background(), svcs, src, nil, "nmap-xml")
+	if len(facts) != cveGroupsPerHost+1 || st.OverCap != 0 {
+		t.Fatalf("facts=%d overcap=%d", len(facts), st.OverCap)
+	}
+	for _, f := range facts {
+		if strings.Contains(f.Summary, "CVE-2021-9999") && !strings.Contains(f.Summary, "+1 more") {
+			t.Errorf("host A's service missing from V's targets: %s", f.Summary)
 		}
 	}
 }
