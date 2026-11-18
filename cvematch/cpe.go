@@ -4,12 +4,13 @@
 // nothing, and every CVE it emits is an UNVERIFIED lead that a worker must confirm.
 //
 // The matching is intentionally conservative about what counts as "the same
-// product" (vendor+product from a CPE, or a normalized product name) and about
-// version ranges, because a version match is a lead — banners lie, distributions
-// backport fixes without bumping the version, and a CPE can be wrong.
+// product" (canonical vendor:product pairs, see aliases.go) and about version
+// ranges, because a version match is a lead — banners lie, distributions backport
+// fixes without bumping the version, and a CPE can be wrong.
 package cvematch
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -23,65 +24,78 @@ type Product struct {
 
 func (p Product) empty() bool { return p.Vendor == "" && p.Product == "" }
 
-// key is the index key used by a Source: "vendor:product". With an empty vendor
-// (product-only lookups) it is ":product".
+// key is "vendor:product" (":product" with no vendor), used for dedup.
 func (p Product) key() string { return p.Vendor + ":" + p.Product }
 
-// ParseCPE parses a CPE 2.2 URI ("cpe:/a:openbsd:openssh:8.2") or a CPE 2.3
-// formatted string ("cpe:2.3:a:openbsd:openssh:8.2:*:*:...") and returns the
-// vendor, product and (if present) version. ok is false when s is not a CPE.
-//
-// Only the application part ("a") and operating-system part ("o") are accepted;
-// hardware ("h") is ignored. "*" and "-" version fields are treated as absent.
-func ParseCPE(s string) (prod Product, version string, ok bool) {
+// String is "vendor:product", or just the product when no vendor is known.
+func (p Product) String() string {
+	if p.Vendor == "" {
+		return p.Product
+	}
+	return p.Vendor + ":" + p.Product
+}
+
+// CPE is a parsed CPE name. Every field is lowercased and unescaped, and the
+// wildcards "*" (any) and "-" (not applicable) are mapped to "".
+type CPE struct {
+	Part    string // "a" application, "o" operating system, "h" hardware
+	Vendor  string
+	Product string
+	Version string
+	Update  string
+}
+
+// Prod returns the vendor:product identity.
+func (c CPE) Prod() Product { return Product{Vendor: c.Vendor, Product: c.Product} }
+
+// FullVersion joins version and update the way banners print them. NVD records
+// OpenSSH 8.5p1 as version "8.5" with update "p1", while nmap reports "8.5p1".
+// With no version there is no full version, whatever the update says.
+func (c CPE) FullVersion() string {
+	if c.Version == "" {
+		return ""
+	}
+	return c.Version + c.Update
+}
+
+// ParseCPEName parses a CPE 2.2 URI ("cpe:/a:openbsd:openssh:8.2p1") or a CPE 2.3
+// formatted string ("cpe:2.3:a:openbsd:openssh:8.5:p1:*:..."). ok is false when s
+// is not a CPE or names neither a vendor nor a product.
+func ParseCPEName(s string) (CPE, bool) {
 	s = strings.TrimSpace(strings.ToLower(s))
+	var f []string
 	switch {
 	case strings.HasPrefix(s, "cpe:2.3:"):
-		return parseCPE23(s)
+		f = splitCPE23(s[len("cpe:2.3:"):])
 	case strings.HasPrefix(s, "cpe:/"):
-		return parseCPE22(s)
+		f = strings.Split(s[len("cpe:/"):], ":")
+	default:
+		return CPE{}, false
 	}
-	return Product{}, "", false
-}
-
-// parseCPE23: cpe:2.3:<part>:<vendor>:<product>:<version>:<update>:...
-func parseCPE23(s string) (Product, string, bool) {
-	f := splitCPE23(s[len("cpe:2.3:"):])
-	if len(f) < 4 {
-		return Product{}, "", false
-	}
-	if f[0] != "a" && f[0] != "o" {
-		return Product{}, "", false
-	}
-	vendor, product := cpeField(f[1]), cpeField(f[2])
-	if vendor == "" && product == "" {
-		return Product{}, "", false
-	}
-	version := ""
-	if len(f) >= 4 {
-		version = cpeVersion(f[3])
-	}
-	return Product{Vendor: vendor, Product: product}, version, true
-}
-
-// parseCPE22: cpe:/<part>:<vendor>:<product>:<version>:...
-func parseCPE22(s string) (Product, string, bool) {
-	f := strings.Split(s[len("cpe:/"):], ":")
 	if len(f) < 3 {
-		return Product{}, "", false
+		return CPE{}, false
 	}
-	if f[0] != "a" && f[0] != "o" {
-		return Product{}, "", false
-	}
-	vendor, product := cpeField(f[1]), cpeField(f[2])
-	if vendor == "" && product == "" {
-		return Product{}, "", false
-	}
-	version := ""
+	c := CPE{Part: cpeField(f[0]), Vendor: cpeField(f[1]), Product: cpeField(f[2])}
 	if len(f) >= 4 {
-		version = cpeVersion(f[3])
+		c.Version = cpeField(f[3])
 	}
-	return Product{Vendor: vendor, Product: product}, version, true
+	if len(f) >= 5 {
+		c.Update = cpeField(f[4])
+	}
+	if c.Vendor == "" && c.Product == "" {
+		return CPE{}, false
+	}
+	return c, true
+}
+
+// ParseCPE parses a CPE and returns its vendor/product and full version. Only the
+// application ("a") and operating-system ("o") parts are accepted.
+func ParseCPE(s string) (prod Product, version string, ok bool) {
+	c, ok := ParseCPEName(s)
+	if !ok || (c.Part != "a" && c.Part != "o") {
+		return Product{}, "", false
+	}
+	return c.Prod(), c.FullVersion(), true
 }
 
 // splitCPE23 splits on unescaped colons. CPE 2.3 escapes a literal colon as "\:".
@@ -102,8 +116,7 @@ func splitCPE23(s string) []string {
 		}
 		cur.WriteByte(s[i])
 	}
-	out = append(out, cur.String())
-	return out
+	return append(out, cur.String())
 }
 
 // cpeField unescapes a CPE 2.3 field and maps the wildcards "*" and "-" to "".
@@ -114,26 +127,13 @@ func cpeField(s string) string {
 	return strings.ReplaceAll(s, "\\", "")
 }
 
-// cpeVersion is cpeField for a version: wildcards and the literal "*"/"-" mean the
-// CPE pins no single version.
-func cpeVersion(s string) string {
-	v := cpeField(s)
-	if v == "*" || v == "-" {
-		return ""
-	}
-	return v
-}
-
-// NormalizeProductName maps a free product/service name (an nmap product string, a
-// service_name, a technology label) to a best-effort Product with an empty vendor,
-// for product-only lookups. It lowercases, keeps letters, digits, '-', '_' and '.',
-// and collapses whitespace to a single '_'. It returns an empty Product when nothing
-// usable remains.
+// NormalizeProductName maps a free product/service name (an nmap product string,
+// a service_name, a technology label) to a best-effort Product with an empty
+// vendor. It lowercases, keeps letters, digits, '-', '_' and '.', and joins words
+// with '_' the way NVD product names are written. It returns an empty Product when
+// nothing usable remains.
 func NormalizeProductName(name string) Product {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
-		return Product{}
-	}
 	var b strings.Builder
 	prevSpace := false
 	for _, r := range name {
@@ -147,7 +147,6 @@ func NormalizeProductName(name string) Product {
 			}
 			prevSpace = true
 		default:
-			// drop anything else (slashes, parens, etc.)
 			prevSpace = false
 		}
 	}
@@ -158,6 +157,105 @@ func NormalizeProductName(name string) Product {
 	return Product{Product: p}
 }
 
+// versionDigitRe requires at least one digit in a version.
+var versionDigitRe = regexp.MustCompile(`[0-9]`)
+
+// NormalizeVersion reduces an observed version string to the comparable version
+// token: the text up to the first space, '(' , ',' or ';' (nmap prints
+// "8.2p1 Ubuntu 4ubuntu0.5", servers print "2.4.41 (Ubuntu)"), lowercased, with a
+// leading "v" before a digit dropped. It returns "" when no digit remains, since a
+// version that cannot be ordered must not place anything inside a range.
+func NormalizeVersion(raw string) string {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	// nmap prints a bound when it cannot read the version ("10.3.23 or earlier"):
+	// that is not a version and must not be placed inside a range.
+	if strings.Contains(v, " or earlier") || strings.Contains(v, " or later") {
+		return ""
+	}
+	if i := strings.IndexAny(v, " \t(,;"); i >= 0 {
+		v = v[:i]
+	}
+	if len(v) > 1 && v[0] == 'v' && v[1] >= '0' && v[1] <= '9' {
+		v = v[1:]
+	}
+	v = strings.Trim(v, ".-_+~")
+	if len(v) > 64 || !versionDigitRe.MatchString(v) || versionWildcardRe.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+// versionWildcardRe matches a version with a wildcard component ("2.4.x", "5.*"),
+// which names a series, not a version.
+var versionWildcardRe = regexp.MustCompile(`(^|[.\-])(x|\*)($|[.\-])`)
+
+// mariadbCompatPrefix is the "5.5.5-" MariaDB puts before its real version in the
+// MySQL handshake for old-client compatibility ("5.5.5-10.3.39-MariaDB").
+const mariadbCompatPrefix = "5.5.5-"
+
+// distroPatterns names the distributions whose packages routinely backport
+// security fixes without changing the upstream version. Order matters: the first
+// match wins, so the more specific names come first.
+var distroPatterns = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"raspbian", regexp.MustCompile(`raspbian`)},
+	{"ubuntu", regexp.MustCompile(`ubuntu`)},
+	{"debian", regexp.MustCompile(`debian|\+deb[0-9]|deb[0-9]+u[0-9]+`)},
+	{"rocky", regexp.MustCompile(`rocky`)},
+	{"almalinux", regexp.MustCompile(`almalinux`)},
+	{"centos", regexp.MustCompile(`centos`)},
+	{"rhel", regexp.MustCompile(`red ?hat|rhel|\.el[0-9]+`)},
+	{"fedora", regexp.MustCompile(`fedora|\.fc[0-9]+`)},
+	{"suse", regexp.MustCompile(`suse|sles`)},
+	{"alpine", regexp.MustCompile(`alpine`)},
+	{"amazon", regexp.MustCompile(`amzn|amazon linux`)},
+	{"freebsd", regexp.MustCompile(`freebsd`)},
+}
+
+// DetectDistro reports the distribution a service's build comes from, from its
+// version string, nmap extra info or Server header comment. It returns "" when
+// none is recognized. The result is always one of a fixed set of names.
+func DetectDistro(texts ...string) string {
+	all := strings.ToLower(strings.Join(texts, " "))
+	if all == "" {
+		return ""
+	}
+	for _, d := range distroPatterns {
+		if d.re.MatchString(all) {
+			return d.name
+		}
+	}
+	return ""
+}
+
+// distroFromOSCPE maps an operating-system CPE that nmap attaches to a service
+// (e.g. cpe:/o:canonical:ubuntu_linux) to a distribution name, "" otherwise.
+func distroFromOSCPE(c CPE) string {
+	switch c.Vendor + ":" + c.Product {
+	case "canonical:ubuntu_linux":
+		return "ubuntu"
+	case "debian:debian_linux":
+		return "debian"
+	case "redhat:enterprise_linux", "redhat:linux":
+		return "rhel"
+	case "centos:centos":
+		return "centos"
+	case "fedoraproject:fedora":
+		return "fedora"
+	case "suse:linux_enterprise_server", "opensuse:leap", "novell:suse_linux":
+		return "suse"
+	case "alpinelinux:alpine_linux":
+		return "alpine"
+	case "amazon:linux", "amazon:amazon_linux":
+		return "amazon"
+	case "freebsd:freebsd":
+		return "freebsd"
+	}
+	return ""
+}
+
 // CompareVersions compares two dotted/alphanumeric version strings and returns
 // -1, 0, or +1. It tokenizes each version into numeric and alphabetic runs
 // (so "8.2p1" -> [8, 2, "p", 1]) and compares token by token: numeric tokens
@@ -166,10 +264,13 @@ func NormalizeProductName(name string) Product {
 // total order good enough to place a version inside an inclusive/exclusive range;
 // it is not a full SemVer / RPM evr comparator.
 func CompareVersions(a, b string) int {
-	ta, tb := versionTokens(a), versionTokens(b)
+	return compareTokens(versionTokens(a), versionTokens(b))
+}
+
+func compareTokens(ta, tb []token) int {
 	for i := 0; i < len(ta) || i < len(tb); i++ {
 		if i >= len(ta) {
-			return -1 // a ran out first -> a is the shorter/earlier version
+			return -1
 		}
 		if i >= len(tb) {
 			return 1
@@ -181,8 +282,7 @@ func CompareVersions(a, b string) int {
 	return 0
 }
 
-// token is one run of a version string: numeric (num set, isNum true) or
-// alphabetic (text set).
+// token is one run of a version string: numeric (isNum) or alphabetic (text).
 type token struct {
 	num   int
 	text  string
@@ -201,7 +301,10 @@ func versionTokens(v string) []token {
 			for j < len(v) && v[j] >= '0' && v[j] <= '9' {
 				j++
 			}
-			n, _ := strconv.Atoi(v[i:j])
+			n, err := strconv.Atoi(v[i:j])
+			if err != nil {
+				n = int(^uint(0) >> 1) // an absurdly long run sorts last, never wraps
+			}
 			out = append(out, token{num: n, isNum: true})
 			i = j
 		case c >= 'a' && c <= 'z':
@@ -212,8 +315,7 @@ func versionTokens(v string) []token {
 			out = append(out, token{text: v[i:j]})
 			i = j
 		default:
-			// separators ('.', '-', '_', '+', 'p' handled as alpha above) split tokens
-			i++
+			i++ // separators split tokens
 		}
 	}
 	return out
@@ -227,14 +329,12 @@ func compareToken(a, b token) int {
 			return -1
 		case a.num > b.num:
 			return 1
-		default:
-			return 0
 		}
-	case a.isNum && !b.isNum:
+		return 0
+	case a.isNum:
 		return -1 // 1.0 < 1.0a : a numeric token precedes an alpha token
-	case !a.isNum && b.isNum:
+	case b.isNum:
 		return 1
-	default:
-		return strings.Compare(a.text, b.text)
 	}
+	return strings.Compare(a.text, b.text)
 }

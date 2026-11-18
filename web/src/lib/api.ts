@@ -866,6 +866,10 @@ export const api = {
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
   noiseStatus: () => get<import("@/lib/types").NoiseStatus>(`/settings/noise`),
+  // CVE correlation feed: status, reload of the feed dir, sync from the NVD API.
+  cveStatus: () => get<import("@/lib/types").CveFeedStatus>(`/settings/cve`),
+  cveReload: () => post<import("@/lib/types").CveFeedStatus>(`/settings/cve/reload`),
+  cveSync: (full = false) => post<import("@/lib/types").CveFeedStatus>(`/settings/cve/sync`, { full }),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;

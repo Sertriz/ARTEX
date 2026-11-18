@@ -1034,6 +1034,47 @@ export interface NoiseStatus {
   }[];
 }
 
+// GET /api/settings/cve: the CVE correlation feed (ARTEX_CVE_FEED_DIR). The NVD
+// API key is reported as configured or not, never by value.
+export interface CveFeedStatus {
+  enabled: boolean;
+  active: boolean;
+  hint?: string;
+  dir?: string;
+  loaded?: {
+    files: number;
+    error_files: number;
+    errors: string[] | null;
+    cves: number;
+    records: number;
+    products: number;
+    rejected: number;
+    superseded: number;
+  };
+  loaded_at?: string | null;
+  load_error?: string;
+  sync?: {
+    running: boolean;
+    started_at: string | null;
+    last: {
+      mode: string;
+      since?: string;
+      until: string;
+      requests: number;
+      received: number;
+      written: number;
+      removed: number;
+      files: number;
+    } | null;
+    last_at: string | null;
+    last_error: string;
+    interval: string;
+    api_key_configured: boolean;
+    feed_last_modified?: string | null;
+    feed_last_full_sync?: string | null;
+  };
+}
+
 // ---- Vulnerability IM push ----
 
 // NotificationFilter is a channel's filter conditions; all fields are optional, absent means no filtering.

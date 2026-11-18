@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -160,6 +161,8 @@ type nmapHost struct {
 			Product string   `xml:"product,attr"`
 			Version string   `xml:"version,attr"`
 			Tunnel  string   `xml:"tunnel,attr"`
+			Extra   string   `xml:"extrainfo,attr"`
+			OSType  string   `xml:"ostype,attr"`
 			CPE     []string `xml:"cpe"`
 		} `xml:"service"`
 	} `xml:"ports>port"`
@@ -220,16 +223,21 @@ func nmapWebScheme(name, tunnel string) string {
 }
 
 // addServiceObs records a service for CVE correlation when it carries something to
-// match on (a product name or a CPE). Version may be empty — the correlator then
-// keeps only "all versions" entries. The descriptor is inert fact-detail text.
-func (s *scanIngest) addServiceObs(ip, portProto, serviceName, product, version string, cpes []string) {
+// match on (a product name or a CPE). target is a validated label built by the
+// caller; assetIdx is the index of the service's asset in s.Assets. The raw
+// product, version and extra strings only feed the correlator and the inert fact
+// detail, never a summary.
+func (s *scanIngest) addServiceObs(target string, assetIdx int, product, version, extra string, cpes []string) {
 	if strings.TrimSpace(product) == "" && len(cpes) == 0 {
 		return
 	}
-	desc := strings.TrimSpace(fmt.Sprintf("%s %s %s %s %s", ip, portProto, serviceName, product, version))
+	if len(s.Services) >= cveServicesPerFile {
+		return
+	}
 	s.Services = append(s.Services, cveServiceObs{
-		Desc: desc,
-		Obs:  cvematch.Observation{CPEs: cpes, Product: product, Version: version},
+		Target:   target,
+		AssetIdx: assetIdx,
+		Obs:      cvematch.Observation{CPEs: cpes, Product: product, Version: version, Extra: extra},
 	})
 }
 
@@ -277,7 +285,9 @@ func (s *scanIngest) addNmapHost(h nmapHost) {
 		ports = append(ports, map[string]any{"port": pp, "service": p.Svc.Name, "product": p.Svc.Product,
 			"version": p.Svc.Version, "tunnel": p.Svc.Tunnel, "cpe": p.Svc.CPE})
 		s.note("ports", ip+" "+pp+" "+name)
-		s.addServiceObs(ip, pp, name, p.Svc.Product, p.Svc.Version, p.Svc.CPE)
+		// The service asset is appended next, at index len(s.Assets).
+		s.addServiceObs(net.JoinHostPort(ip, strconv.Itoa(port))+"/"+p.Proto, len(s.Assets),
+			p.Svc.Product, p.Svc.Version, p.Svc.Extra+" "+p.Svc.OSType, p.Svc.CPE)
 		if scheme := nmapWebScheme(name, p.Svc.Tunnel); scheme != "" && p.Proto == "tcp" {
 			u := scheme + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
 			s.urls[u] = true
@@ -432,11 +442,71 @@ func (s *scanIngest) addHttpx(line []byte) {
 	if r.ContentLength > 0 {
 		item.ContentLength = &r.ContentLength
 	}
+	s.addHttpxServices(u, len(s.Assets), r.Tech, r.Webserver)
 	s.Assets = append(s.Assets, item)
 	s.note("urls", fmt.Sprintf("%s %d", u, r.StatusCode))
 	s.fact(fmt.Sprintf("httpx: %s responded with status %d", u, r.StatusCode),
 		map[string]any{"title": r.Title, "tech": r.Tech, "webserver": r.Webserver, "content_length": r.ContentLength,
 			"host": stripUserinfo(r.Host), "ip": r.IP, "tls": r.TLS})
+}
+
+// httpxTechMax caps the technologies and Server-header products correlated per URL.
+const httpxTechMax = 20
+
+// serverCommentRe matches a parenthesized Server-header comment, "(Ubuntu)".
+var serverCommentRe = regexp.MustCompile(`\([^)]*\)`)
+
+// addHttpxServices records the versioned products an httpx result names for CVE
+// correlation: its technologies ("Nginx:1.18.0", wappalyzer style) and the
+// products of its Server header ("Apache/2.4.41 (Ubuntu) OpenSSL/1.1.1f").
+// Unversioned products are skipped: without a version nothing can be placed in a
+// range. The header and technology list also serve as the distribution hint.
+func (s *scanIngest) addHttpxServices(u string, assetIdx int, tech []string, webserver string) {
+	target := httpTarget(u)
+	extra := webserver + " " + strings.Join(tech, " ")
+	seen := map[string]bool{}
+	add := func(name, version string) {
+		name, version = strings.TrimSpace(name), strings.TrimSpace(version)
+		key := strings.ToLower(name) + "\x00" + version
+		if name == "" || cvematch.NormalizeVersion(version) == "" || seen[key] || len(seen) >= httpxTechMax {
+			return
+		}
+		seen[key] = true
+		s.addServiceObs(target, assetIdx, name, version, extra, nil)
+	}
+	for _, t := range tech {
+		if i := strings.LastIndex(t, ":"); i > 0 {
+			add(t[:i], t[i+1:])
+		}
+	}
+	for _, tok := range strings.Fields(serverCommentRe.ReplaceAllString(webserver, " ")) {
+		if name, version, ok := strings.Cut(tok, "/"); ok {
+			add(name, version)
+		}
+	}
+}
+
+// httpTarget reduces a validated http(s) URL to "scheme://host[:port]" for a
+// fact summary: the path, query and fragment are target-shaped and left out.
+func httpTarget(raw string) string {
+	pu, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	host := scanHost(pu.Hostname())
+	if host == "" {
+		return ""
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if p := pu.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n <= 0 || n > 65535 {
+			return ""
+		}
+		host += ":" + p
+	}
+	return pu.Scheme + "://" + host
 }
 
 // ---- ffuf -of json ----
