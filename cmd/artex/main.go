@@ -54,13 +54,15 @@ func run() int {
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 
 		cveSync     = flag.Bool("cve-sync", false, "sync the CVE feed in ARTEX_CVE_FEED_DIR from the NVD API (full the first time, incremental after), print a summary and exit")
-		cveSyncFull = flag.Bool("cve-sync-full", false, "with -cve-sync: force a full re-sync")
+		cveSyncFull = flag.Bool("cve-sync-full", false, "like -cve-sync, but force a full re-sync")
 		cveCheck    = flag.Bool("cve-check", false, "load the CVE feed in ARTEX_CVE_FEED_DIR, print what it holds and exit (1 when it holds no CVE)")
 	)
 	flag.Parse()
 
-	if *cveSync || *cveCheck {
-		return runCVECommand(*cveSync, *cveSyncFull, *cveCheck, os.Stdout)
+	// -cve-sync-full implies -cve-sync: on its own it must never fall through and
+	// start a second server next to the running one.
+	if *cveSync || *cveSyncFull || *cveCheck {
+		return runCVECommand(*cveSync || *cveSyncFull, *cveSyncFull, *cveCheck, os.Stdout)
 	}
 
 	// hand the build version to the server package so GET /api/health can report it

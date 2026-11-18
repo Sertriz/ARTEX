@@ -35,6 +35,10 @@ type Entry struct {
 	StartExcluding string
 	EndIncluding   string
 	EndExcluding   string
+
+	// Platforms is set when NVD limits the record to a platform (an AND
+	// configuration such as "php:php ... running on o:microsoft:windows").
+	Platforms PlatformSet
 }
 
 func (e Entry) hasRange() bool {
@@ -98,6 +102,7 @@ type rec struct {
 	meta   uint32
 	lo, hi uint32
 	flags  uint8
+	plat   PlatformSet // NVD "running on" restriction; 0 = none (fits the padding)
 }
 
 // tables are the shared arrays records index into.
@@ -115,6 +120,7 @@ func (t *tables) entry(r rec, p Product) Entry {
 		Score:       m.score,
 		Vector:      m.vector,
 		Description: m.desc,
+		Platforms:   r.plat,
 	}
 	switch {
 	case r.flags&fExact != 0:
@@ -193,11 +199,12 @@ func (s *NVDSource) Match(p Product, version string) []Entry {
 	}
 	vendors := s.byProduct[p.Product]
 	vt := versionTokens(version)
+	portable := p.Product == "openssh"
 	var out []Entry
 	emit := func(vendor string, recs []rec) {
 		pr := Product{Vendor: vendor, Product: p.Product}
 		for _, r := range recs {
-			if s.holds(r, version, vt) {
+			if s.holds(r, version, vt, portable) {
 				out = append(out, s.entry(r, pr))
 			}
 		}
@@ -216,7 +223,7 @@ func (s *NVDSource) Match(p Product, version string) []Entry {
 // holds reports whether the record's constraint admits the version (tokenized as
 // vt): a pinned version must be equal, a range must contain it, and an unbounded
 // record admits anything. An empty version only satisfies an unbounded record.
-func (t *tables) holds(r rec, version string, vt []token) bool {
+func (t *tables) holds(r rec, version string, vt []token, portable bool) bool {
 	if r.flags == 0 {
 		return true
 	}
@@ -233,7 +240,7 @@ func (t *tables) holds(r rec, version string, vt []token) bool {
 	if r.flags&fStartExcl != 0 && compareTokens(vt, versionTokens(lo)) <= 0 {
 		return false
 	}
-	if r.flags&fEndIncl != 0 && compareTokens(vt, versionTokens(hi)) > 0 {
+	if r.flags&fEndIncl != 0 && compareTokens(vt, versionTokens(hi)) > 0 && !portableOnBound(version, hi, portable) {
 		return false
 	}
 	if r.flags&fEndExcl != 0 && compareTokens(vt, versionTokens(hi)) >= 0 {
@@ -577,6 +584,7 @@ func (l *loader) add(c nvdCVE) {
 	})
 	l.byID[id] = mi
 	for _, cfg := range c.Configurations {
+		plat := configPlatform(cfg)
 		for _, node := range cfg.Nodes {
 			for _, m := range node.CPEMatch {
 				if !m.Vulnerable {
@@ -586,28 +594,46 @@ func (l *loader) add(c nvdCVE) {
 				if !ok || cpe.Product == "" || (cpe.Part != "a" && cpe.Part != "o") {
 					continue
 				}
-				r := rec{meta: mi}
+				r := rec{meta: mi, plat: plat}
 				switch {
 				case m.VersionStartIncluding != "" || m.VersionStartExcluding != "" ||
 					m.VersionEndIncluding != "" || m.VersionEndExcluding != "":
-					if v := m.VersionStartIncluding; v != "" {
-						r.flags |= fStartIncl
-						r.lo = l.version(v)
-					} else if v := m.VersionStartExcluding; v != "" {
-						r.flags |= fStartExcl
-						r.lo = l.version(v)
+					// A ranged criteria can still name an update: OpenSSH's
+					// "openssh:*:p2 <= 7.2" (CVE-2016-6210) means up to 7.2p2. The
+					// update belongs to the upper bound (or the lower one alone).
+					start, end := m.VersionStartIncluding, m.VersionEndIncluding
+					if start == "" {
+						start = m.VersionStartExcluding
 					}
-					if v := m.VersionEndIncluding; v != "" {
+					if end == "" {
+						end = m.VersionEndExcluding
+					}
+					if cpe.Update != "" {
+						if end != "" {
+							end += cpe.Update
+						} else {
+							start += cpe.Update
+						}
+					}
+					if m.VersionStartIncluding != "" {
+						r.flags |= fStartIncl
+						r.lo = l.version(start)
+					} else if m.VersionStartExcluding != "" {
+						r.flags |= fStartExcl
+						r.lo = l.version(start)
+					}
+					if m.VersionEndIncluding != "" {
 						r.flags |= fEndIncl
-						r.hi = l.version(v)
-					} else if v := m.VersionEndExcluding; v != "" {
+						r.hi = l.version(end)
+					} else if m.VersionEndExcluding != "" {
 						r.flags |= fEndExcl
-						r.hi = l.version(v)
+						r.hi = l.version(end)
 					}
 				case cpe.FullVersion() != "":
 					r.flags = fExact
 					r.lo = l.version(cpe.FullVersion())
 				}
+				applyErrata(id, cpe, &r, l.versions)
 				product, vendor := l.str(cpe.Product), l.str(cpe.Vendor)
 				vendors := l.byProduct[product]
 				if vendors == nil {
@@ -618,6 +644,68 @@ func (l *loader) add(c nvdCVE) {
 			}
 		}
 	}
+}
+
+// configPlatform returns the platforms an AND configuration limits its vulnerable
+// records to: the families of the CPEs in its nodes that hold no vulnerable match
+// (NVD's "running on" nodes, such as o:microsoft:windows for CVE-2024-4577). A
+// plain configuration, or one that negates, restricts nothing.
+func configPlatform(cfg nvdConfigNode) PlatformSet {
+	if !strings.EqualFold(cfg.Operator, "AND") || cfg.Negate {
+		return 0
+	}
+	var plat PlatformSet
+	for _, n := range cfg.Nodes {
+		vulnerable := false
+		for _, m := range n.CPEMatch {
+			vulnerable = vulnerable || m.Vulnerable
+		}
+		if vulnerable {
+			continue
+		}
+		if n.Negate {
+			return 0 // "not running on X" is not a platform restriction we can use
+		}
+		for _, m := range n.CPEMatch {
+			if c, ok := ParseCPEName(m.Criteria); ok {
+				plat |= platformOf(c)
+			} else {
+				plat |= PlatformOther
+			}
+		}
+	}
+	return plat
+}
+
+// erratum corrects one NVD record bound that is demonstrably wrong.
+type erratum struct {
+	cve, product string
+	endIncluding string // an inclusive upper bound that should be exclusive
+}
+
+// errata lists known NVD mistakes that would otherwise flag a fixed release:
+//   - CVE-2024-6387 (regreSSHion) is filed as openssh "<= 9.8", but 9.8/9.8p1 is
+//     the fix release (OpenSSH 9.8 release notes); the bound is exclusive.
+var errata = []erratum{{cve: "CVE-2024-6387", product: "openssh", endIncluding: "9.8"}}
+
+func applyErrata(id string, cpe CPE, r *rec, versions []string) {
+	for _, e := range errata {
+		if e.cve == id && e.product == cpe.Product && r.flags&fEndIncl != 0 && versions[r.hi] == e.endIncluding {
+			r.flags = r.flags&^fEndIncl | fEndExcl
+		}
+	}
+}
+
+// portableOnBound reports whether an OpenSSH portable release sits on an
+// inclusive upper bound that names the bare release: NVD writes "<= 7.9" for
+// "through release 7.9", which includes the portable 7.9p1 every Linux sshd
+// reports (CVE-2019-6111, CVE-2018-15473 "<= 7.7", CVE-2016-20012 "<= 8.7").
+func portableOnBound(version, bound string, portable bool) bool {
+	if !portable || portableSuffixRe.MatchString(bound) {
+		return false
+	}
+	base := stripPortable(version)
+	return base != version && CompareVersions(base, bound) == 0
 }
 
 // finish drops superseded/rejected records, trims every bucket to its size and
@@ -716,9 +804,15 @@ type nvdMetric struct {
 }
 
 type nvdConfigNode struct {
-	Nodes []struct {
-		CPEMatch []nvdCPEMatch `json:"cpeMatch"`
-	} `json:"nodes"`
+	Operator string    `json:"operator"` // "AND": the vulnerable nodes hold only on the platform nodes
+	Negate   bool      `json:"negate"`
+	Nodes    []nvdNode `json:"nodes"`
+}
+
+type nvdNode struct {
+	Operator string        `json:"operator"`
+	Negate   bool          `json:"negate"`
+	CPEMatch []nvdCPEMatch `json:"cpeMatch"`
 }
 
 type nvdCPEMatch struct {

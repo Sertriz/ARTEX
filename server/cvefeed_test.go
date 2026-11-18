@@ -91,7 +91,7 @@ func TestCVEFeedReload(t *testing.T) {
 		t.Fatal("no source installed")
 	}
 	st := f.status()
-	if st["active"] != true || st["loaded"].(cvematch.LoadStats).CVEs != 7 {
+	if st["active"] != true || st["loaded"].(cvematch.LoadStats).CVEs != 19 {
 		t.Fatalf("status %v", st)
 	}
 
@@ -203,7 +203,7 @@ func TestCVEFeedHTTP(t *testing.T) {
 	if code, m := do("POST", "/api/settings/cve/reload", ""); code != 200 || m["active"] != true {
 		t.Fatalf("reload: %d %v", code, m)
 	}
-	if code, m := do("GET", "/api/settings/cve", ""); code != 200 || m["loaded"].(map[string]any)["cves"].(float64) != 7 {
+	if code, m := do("GET", "/api/settings/cve", ""); code != 200 || m["loaded"].(map[string]any)["cves"].(float64) != 19 {
 		t.Fatalf("status: %d %v", code, m)
 	}
 	if code, _ := do("POST", "/api/settings/cve/sync", `{"full":true}`); code != 202 {
@@ -236,5 +236,55 @@ func TestCVEFeedEnv(t *testing.T) {
 	t.Setenv("ARTEX_CVE_SYNC_INTERVAL", "24h")
 	if f := newCVEFeedFromEnv(); f.interval != 24*time.Hour {
 		t.Errorf("interval %v", f.interval)
+	}
+}
+
+func TestCVEFeedSyncRunningUntilReloaded(t *testing.T) {
+	rec := &installRecorder{}
+	f := testFeed(copyTestFeed(t), rec)
+	f.syncFn = func(context.Context, nvdsync.Options) (nvdsync.Stats, error) {
+		return nvdsync.Stats{Mode: "full", Written: 7}, nil
+	}
+	if err := f.startSync(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	// Poll as fast as possible: the first status that says the sync finished must
+	// already show the feed it loaded, never the empty one it replaced.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st := f.status()
+		if st["sync"].(map[string]any)["running"] == false {
+			if st["active"] != true || st["loaded"].(cvematch.LoadStats).CVEs == 0 {
+				t.Fatalf("finished sync shown next to the unloaded feed: %v", st)
+			}
+			return
+		}
+	}
+	t.Fatal("the sync never finished")
+}
+
+func TestCVEFeedFailedAttemptKeepsLastSuccess(t *testing.T) {
+	rec := &installRecorder{}
+	f := testFeed(copyTestFeed(t), rec)
+	clock := time.Date(2026, 1, 5, 3, 0, 0, 0, time.UTC)
+	f.now = func() time.Time { return clock }
+	f.syncFn = func(context.Context, nvdsync.Options) (nvdsync.Stats, error) {
+		return nvdsync.Stats{Mode: "full", Written: 250000}, nil
+	}
+	if err := f.startSync(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return f.status()["sync"].(map[string]any)["running"] == false })
+	clock = clock.Add(24 * time.Hour)
+	f.syncFn = func(context.Context, nvdsync.Options) (nvdsync.Stats, error) {
+		return nvdsync.Stats{}, errors.New("NVD answered 503")
+	}
+	if err := f.startSync(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return f.status()["sync"].(map[string]any)["last_error"] != "" })
+	s := f.status()["sync"].(map[string]any)
+	if s["last_at"] != "2026-01-05T03:00:00Z" || s["last_attempt_at"] != "2026-01-06T03:00:00Z" {
+		t.Fatalf("the failed attempt's time was paired with the earlier success: %v", s)
 	}
 }

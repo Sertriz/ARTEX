@@ -1066,8 +1066,9 @@ export interface CveFeedStatus {
       removed: number;
       files: number;
     } | null;
-    last_at: string | null;
-    last_error: string;
+    last_at: string | null; // when `last`, the last successful sync, finished
+    last_error: string; // the last attempt's error, "" when it succeeded
+    last_attempt_at: string | null;
     interval: string;
     api_key_configured: boolean;
     feed_last_modified?: string | null;

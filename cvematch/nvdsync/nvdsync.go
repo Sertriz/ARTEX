@@ -43,9 +43,16 @@ const (
 	windowOverlap = 5 * time.Minute
 	stateName     = ".nvd-sync.json"
 	lockName      = ".nvd-sync.lock"
-	staleLock     = 12 * time.Hour
-	userAgent     = "artex-cve-sync"
-	maxBodyBytes  = 512 << 20 // one API page; a full page is tens of MB
+	// The lock file is touched every lockHeartbeat while a sync runs; one not
+	// touched for staleLock belongs to a sync that died (a restart, an OOM kill)
+	// and is taken over, so a dead sync never blocks the feed for long.
+	lockHeartbeat = time.Minute
+	staleLock     = 5 * time.Minute
+	// shrinkRestarts bounds how often an incremental window is re-read from the
+	// start when its result set shrinks while paging.
+	shrinkRestarts = 3
+	userAgent      = "artex-cve-sync"
+	maxBodyBytes   = 512 << 20 // one API page; a full page is tens of MB
 	// NVD guidance: sleep about six seconds between requests without an API key
 	// (5 requests / 30 s); with a key the limit is 50 requests / 30 s.
 	delayNoKey   = 6 * time.Second
@@ -117,11 +124,16 @@ func Sync(ctx context.Context, o Options) (Stats, error) {
 	}
 	defer unlock()
 
+	if o.Full {
+		return o.full(ctx)
+	}
 	st, err := ReadState(o.Dir)
 	if err != nil {
-		return Stats{}, fmt.Errorf("sync state: %w", err)
+		// A damaged state file must not wedge the feed: start over.
+		o.Logf("[cve-sync] unreadable sync state %s (%v): running a full sync", filepath.Join(o.Dir, stateName), err)
+		return o.full(ctx)
 	}
-	if o.Full || st.LastModEnd.IsZero() {
+	if st.LastModEnd.IsZero() {
 		return o.full(ctx)
 	}
 	return o.incremental(ctx, st)
@@ -167,8 +179,8 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// lock takes the directory's sync lock. A lock older than staleLock is taken
-// over: a sync never runs that long, so its owner died.
+// lock takes the directory's sync lock and keeps it alive with a heartbeat. A
+// lock not touched for staleLock is taken over: its sync died.
 func lock(dir string, now time.Time) (func(), error) {
 	p := filepath.Join(dir, lockName)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -176,7 +188,26 @@ func lock(dir string, now time.Time) (func(), error) {
 		if err == nil {
 			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 			_ = f.Close()
-			return func() { _ = os.Remove(p) }, nil
+			stop := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				t := time.NewTicker(lockHeartbeat)
+				defer t.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case n := <-t.C:
+						_ = os.Chtimes(p, n, n)
+					}
+				}
+			}()
+			return func() {
+				close(stop)
+				<-done
+				_ = os.Remove(p)
+			}, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
@@ -190,6 +221,14 @@ func lock(dir string, now time.Time) (func(), error) {
 	return nil, ErrBusy
 }
 
+// tombstone is the line a rejected record leaves in the feed: the loader's
+// latest-copy rule then drops the CVE wherever else it appears (a mirror seeded
+// into the directory, an older year file).
+func tombstone(r slimRecord) []byte {
+	b, _ := json.Marshal(slimRecord{ID: r.ID, LastModified: r.LastModified, VulnStatus: r.VulnStatus})
+	return b
+}
+
 // full pages through every CVE and replaces all year files.
 func (o Options) full(ctx context.Context) (Stats, error) {
 	until := o.Now().UTC()
@@ -199,7 +238,8 @@ func (o Options) full(ctx context.Context) (Stats, error) {
 	defer w.abort()
 	err := o.fetchAll(ctx, nil, &stats, func(rec slimRecord, line []byte) error {
 		if rec.rejected() {
-			return nil
+			stats.Removed++
+			return w.write(rec.year(), tombstone(rec))
 		}
 		stats.Written++
 		return w.write(rec.year(), line)
@@ -212,7 +252,7 @@ func (o Options) full(ctx context.Context) (Stats, error) {
 		return stats, err
 	}
 	stats.Files = len(files)
-	// A year no longer present (all its records rejected) must not keep stale data.
+	// A year the full sync did not produce must not keep stale data.
 	if err := removeOtherYearFiles(o.Dir, files); err != nil {
 		return stats, err
 	}
@@ -230,7 +270,8 @@ func (o Options) incremental(ctx context.Context, prev State) (Stats, error) {
 	since := prev.LastModEnd.Add(-windowOverlap).UTC()
 	stats := Stats{Mode: "incremental", Since: since, Until: until}
 	o.Logf("[cve-sync] incremental sync %s .. %s", since.Format(time.RFC3339), until.Format(time.RFC3339))
-	changes := map[string]map[string][]byte{} // year -> id -> line (nil = remove)
+	changes := map[string]map[string][]byte{} // year -> id -> line (a tombstone for a rejected record)
+	rejected := map[string]bool{}
 	for start := since; start.Before(until); start = start.Add(maxWindow) {
 		end := start.Add(maxWindow)
 		if end.After(until) {
@@ -245,9 +286,11 @@ func (o Options) incremental(ctx context.Context, prev State) (Stats, error) {
 				changes[y] = map[string][]byte{}
 			}
 			if rec.rejected() {
-				changes[y][rec.ID] = nil
+				changes[y][rec.ID] = tombstone(rec)
+				rejected[rec.ID] = true
 			} else {
 				changes[y][rec.ID] = line
+				delete(rejected, rec.ID)
 			}
 			return nil
 		})
@@ -261,13 +304,19 @@ func (o Options) incremental(ctx context.Context, prev State) (Stats, error) {
 	}
 	sort.Strings(years)
 	for _, y := range years {
-		written, removed, err := mergeYear(o.Dir, y, changes[y])
-		if err != nil {
+		if _, _, err := mergeYear(o.Dir, y, changes[y]); err != nil {
 			return stats, fmt.Errorf("merge %s: %w", yearFile(y), err)
 		}
-		stats.Written += written
-		stats.Removed += removed
 		stats.Files++
+	}
+	for _, ys := range changes {
+		for id := range ys {
+			if rejected[id] {
+				stats.Removed++
+			} else {
+				stats.Written++
+			}
+		}
 	}
 	if err := writeState(o.Dir, State{LastModEnd: until, LastFull: prev.LastFull}); err != nil {
 		return stats, err
@@ -290,8 +339,29 @@ type apiPage struct {
 	} `json:"vulnerabilities"`
 }
 
-// fetchAll pages through one query, handing every trimmed record to emit.
+// errShrank reports a result set that shrank while it was paged: a record moved
+// out of the query (modified again, past the window's end), shifting every later
+// record one index down, so the next page would skip one.
+var errShrank = errors.New("NVD result set shrank while paging")
+
+// fetchAll pages through one query, handing every trimmed record to emit. An
+// incremental window whose result set shrinks is read again from the start (its
+// records are keyed by id, so the repeats are harmless); if it keeps shrinking, or
+// a full sync's does, the sync fails before its state moves, and the next one
+// fetches the same records again.
 func (o Options) fetchAll(ctx context.Context, q url.Values, stats *Stats, emit func(slimRecord, []byte) error) error {
+	for restarts := 0; ; restarts++ {
+		err := o.fetchPass(ctx, q, stats, emit)
+		if errors.Is(err, errShrank) && q != nil && restarts < shrinkRestarts {
+			o.Logf("[cve-sync] %v: reading the window again", err)
+			continue
+		}
+		return err
+	}
+}
+
+func (o Options) fetchPass(ctx context.Context, q url.Values, stats *Stats, emit func(slimRecord, []byte) error) error {
+	first := -1
 	for start, total := 0, -1; total < 0 || start < total; {
 		p := url.Values{}
 		for k, v := range q {
@@ -310,6 +380,11 @@ func (o Options) fetchAll(ctx context.Context, q url.Values, stats *Stats, emit 
 			return err
 		}
 		total = page.TotalResults
+		if first < 0 {
+			first = total
+		} else if total < first {
+			return fmt.Errorf("%w (%d -> %d at index %d)", errShrank, first, total, start)
+		}
 		for _, v := range page.Vulnerabilities {
 			rec, line, err := slim(v.CVE)
 			if err != nil {
@@ -425,10 +500,14 @@ type slimDesc struct {
 }
 
 type slimConfig struct {
-	Nodes []slimNode `json:"nodes"`
+	Operator string     `json:"operator,omitempty"`
+	Negate   bool       `json:"negate,omitempty"`
+	Nodes    []slimNode `json:"nodes"`
 }
 
 type slimNode struct {
+	Operator string      `json:"operator,omitempty"`
+	Negate   bool        `json:"negate,omitempty"`
 	CPEMatch []slimMatch `json:"cpeMatch"`
 }
 
@@ -504,11 +583,15 @@ func slim(raw json.RawMessage) (slimRecord, []byte, error) {
 		out.Metrics[k] = []rawMetric{pick}
 	}
 	for _, c := range in.Configurations {
-		var cfg slimConfig
+		// An AND configuration keeps its platform nodes (the non-vulnerable
+		// "running on" CPEs): the loader needs them to tell a Windows-only CVE
+		// from an unconditional one.
+		and := strings.EqualFold(c.Operator, "AND")
+		cfg := slimConfig{Operator: c.Operator, Negate: c.Negate}
 		for _, n := range c.Nodes {
-			var node slimNode
+			node := slimNode{Operator: n.Operator, Negate: n.Negate}
 			for _, m := range n.CPEMatch {
-				if m.Vulnerable && m.Criteria != "" {
+				if m.Criteria != "" && (m.Vulnerable || and) {
 					node.CPEMatch = append(node.CPEMatch, m)
 				}
 			}
@@ -710,13 +793,22 @@ func mergeYear(dir, year string, changes map[string][]byte) (written, removed in
 	return written, removed, nil
 }
 
+// writeState replaces the state file durably: written, synced, then renamed.
 func writeState(dir string, st State) error {
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
 	tmp := filepath.Join(dir, stateName+".tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(b)
+	serr := f.Sync()
+	cerr := f.Close()
+	if err := errors.Join(werr, serr, cerr); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, stateName))

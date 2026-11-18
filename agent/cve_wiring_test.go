@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -109,15 +110,15 @@ func TestCVEWiringEndToEnd(t *testing.T) {
 	for i := range s.Assets {
 		ids[i] = int64(1000 + i)
 	}
-	facts, st := cveFactsFromServices(s.Services, src, ids, "nmap-xml")
+	facts, st := cveFactsFromServices(context.Background(), s.Services, src, ids, "nmap-xml")
 	if len(facts) != 3 || st.Matched != 4 {
 		t.Fatalf("got %d facts (stats %+v):\n%s", len(facts), st, summaries(facts))
 	}
 	expect := []string{
 		// Both Ubuntu hosts run the same OpenSSH build: one fact, two anchors.
-		"CVE lead (unverified): openbsd:openssh 8.2p1 on 198.51.100.10:22/tcp +1 more — CVE-2023-38408, CVE-2021-41617 (1 critical, 1 high); ubuntu build, fixes may be backported",
-		"CVE lead (unverified): vsftpd_project:vsftpd 2.3.4 on 198.51.100.10:21/tcp — CVE-2011-2523 (1 critical, 0 high)",
-		"CVE lead (unverified): f5:nginx 1.18.0 on 198.51.100.10:80/tcp — CVE-2021-23017",
+		"CVE lead (unverified): openbsd:openssh 8.2p1 — CVE-2023-38408, CVE-2021-41617 +1 (1 critical, 1 high); ubuntu build, fixes may be backported; on 198.51.100.10:22/tcp +1 more",
+		"CVE lead (unverified): vsftpd_project:vsftpd 2.3.4 — CVE-2011-2523 (1 critical, 0 high); on 198.51.100.10:21/tcp",
+		"CVE lead (unverified): f5:nginx 1.18.0 — CVE-2021-23017",
 	}
 	for i, want := range expect {
 		if !strings.HasPrefix(facts[i].Summary, want) {
@@ -129,9 +130,9 @@ func TestCVEWiringEndToEnd(t *testing.T) {
 	}
 
 	hs := parseScan(t, "httpx-jsonl", httpxCVEFixture)
-	hf, _ := cveFactsFromServices(hs.Services, src, nil, "httpx-jsonl")
+	hf, _ := cveFactsFromServices(context.Background(), hs.Services, src, nil, "httpx-jsonl")
 	joined := summaries(hf)
-	for _, want := range []string{"f5:nginx 1.18.0 on https://203.0.113.5:8443 — CVE-2021-23017", "apache:http_server 2.4.49 on http://198.51.100.20 — CVE-2021-41773", "openssl:openssl 1.0.1f on http://198.51.100.20 — CVE-2014-0160"} {
+	for _, want := range []string{"f5:nginx 1.18.0 — CVE-2021-23017", "on https://203.0.113.5:8443", "apache:http_server 2.4.49 — CVE-2021-41773", "openssl:openssl 1.0.1f — CVE-2014-0160", "on http://198.51.100.20"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("httpx facts missing %q:\n%s", want, joined)
 		}

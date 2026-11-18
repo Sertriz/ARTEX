@@ -26,6 +26,7 @@ type Observation struct {
 type Candidate struct {
 	CVE         string
 	Product     Product // the vendor:product whose record matched
+	Version     string  // the observed (normalized) version the record was matched with
 	Severity    string  // CRITICAL|HIGH|MEDIUM|LOW|NONE|""
 	Score       float64 // CVSS base score; 0 when unknown
 	Vector      string
@@ -42,14 +43,21 @@ type Candidate struct {
 	// BackportRisk is true for a version-confirmed match on a distribution build,
 	// whose package may carry the fix without a new upstream version.
 	BackportRisk bool
+	// Platforms is set when NVD limits the CVE to a platform the observation did
+	// not reveal (the lead holds only if the host runs one of them). A record whose
+	// platform the observation contradicts is not a candidate at all.
+	Platforms PlatformSet
 }
 
 // Result is the outcome of correlating one observation.
 type Result struct {
-	Candidates []Candidate // version-confirmed first, then by score
+	// Candidates are version-confirmed first, then not platform-conditional, then
+	// by score.
+	Candidates []Candidate
 	Products   []Product   // the canonical products looked up
-	Version    string      // the normalized version matched ("" when none)
+	Version    string      // the primary product's normalized version ("" when none)
 	Distro     string      // detected distribution ("" when none)
+	Platform   PlatformSet // the OS family the observation revealed (0 when none)
 }
 
 // Confirmed returns the version-confirmed candidates.
@@ -68,43 +76,58 @@ func Correlate(obs Observation, src Source) []Candidate {
 	return CorrelateResult(obs, src).Candidates
 }
 
-// CorrelateResult resolves the observation to canonical products, normalizes its
-// version and matches every record of those products. It performs no I/O; src
-// supplies the CVE knowledge.
+// target is one product to look up, with the version observed for it.
+type target struct {
+	p       Product
+	version string
+}
+
+// CorrelateResult resolves the observation to canonical products, each with its
+// own observed version, and matches every record of those products. It performs
+// no I/O; src supplies the CVE knowledge.
 //
 // Matching is conservative: a record with a pinned version or a version range is
-// only kept when the observed version is known and inside it. A record with no
+// only kept when the product's version is known and inside it; a record NVD
+// limits to a platform the observation contradicts is dropped. A record with no
 // version at all is kept as Unbounded. Candidates are deduplicated by CVE (a
-// version-confirmed match beats an unbounded one) and ranked version-confirmed
-// first, then by CVSS score.
+// version-confirmed match beats an unbounded one).
 func CorrelateResult(obs Observation, src Source) Result {
 	if src == nil {
 		return Result{}
 	}
-	products, cpeVersion, distro := resolve(obs, src)
-	version := NormalizeVersion(cpeVersion)
-	if version == "" {
-		version = NormalizeVersion(obs.Version)
+	targets, osCPEs := resolve(obs, src)
+	distro := ""
+	for _, c := range osCPEs {
+		if d := distroFromOSCPE(c); d != "" {
+			distro = d
+			break
+		}
 	}
 	if distro == "" {
 		distro = DetectDistro(obs.Version, obs.Extra)
 	}
-	for _, p := range products {
-		if p.Product == "mariadb" && strings.HasPrefix(version, mariadbCompatPrefix) {
-			version = NormalizeVersion(strings.TrimSuffix(strings.TrimPrefix(version, mariadbCompatPrefix), "-mariadb"))
-			break
+	res := Result{Distro: distro, Platform: observedPlatform(osCPEs, distro, obs.Extra, obs.Version)}
+	for i, t := range targets {
+		res.Products = append(res.Products, t.p)
+		if i == 0 {
+			res.Version = t.version
 		}
 	}
-	res := Result{Products: products, Version: version, Distro: distro}
 
 	best := map[string]Candidate{}
-	for _, p := range products {
-		for _, e := range lookup(src, p, version) {
-			cand, ok := matchEntry(e, version)
+	for _, t := range targets {
+		for _, e := range lookup(src, t.p, t.version) {
+			if contradicts(e.Platforms, res.Platform) {
+				continue
+			}
+			cand, ok := matchEntry(e, t.version)
 			if !ok {
 				continue
 			}
 			cand.BackportRisk = cand.VersionConfirmed && distro != ""
+			if res.Platform == 0 {
+				cand.Platforms = e.Platforms
+			}
 			if cur, exists := best[cand.CVE]; !exists || better(cand, cur) {
 				best[cand.CVE] = cand
 			}
@@ -118,6 +141,9 @@ func CorrelateResult(obs Observation, src Source) Result {
 		if a.VersionConfirmed != b.VersionConfirmed {
 			return a.VersionConfirmed
 		}
+		if (a.Platforms == 0) != (b.Platforms == 0) {
+			return a.Platforms == 0
+		}
 		if a.Score != b.Score {
 			return a.Score > b.Score
 		}
@@ -126,19 +152,22 @@ func CorrelateResult(obs Observation, src Source) Result {
 	return res
 }
 
-// resolve maps the observation to the canonical products to look up, the version
-// carried by an application CPE, and a distribution named by an OS CPE.
-func resolve(obs Observation, src Source) (products []Product, cpeVersion, distro string) {
-	seen := map[string]bool{}
-	add := func(ps ...Product) {
-		for _, p := range ps {
-			if p.Product == "" || seen[p.key()] {
-				continue
-			}
-			seen[p.key()] = true
-			products = append(products, p)
-		}
-	}
+// resolve maps the observation to the products to look up, each with the version
+// observed for it, and returns the OS CPEs (a distribution and platform hint).
+//
+// Each application CPE keeps its own version: nmap emits several for one service
+// (BaseHTTPServer's version, then Python's), and one product must never be
+// checked against another's version. A CPE version is trusted only when it is
+// what the banner says: when nmap could read just a series, a bound or a range
+// ("4.X", "3.11 or later", "5.12.0 - 5.15.4"), its CPE carries the truncated
+// series ("4", "3", "5"), which is not a version either; when the CPE truncates a
+// full banner version ("13" vs "13.23"), the banner's is used.
+func resolve(obs Observation, src Source) (targets []target, osCPEs []CPE) {
+	raw := strings.ToLower(strings.TrimSpace(obs.Version))
+	obsVersion := NormalizeVersion(raw)
+	notAVersion := raw != "" && obsVersion == ""
+
+	var appCPEs []CPE
 	for _, s := range obs.CPEs {
 		c, ok := ParseCPEName(s)
 		if !ok {
@@ -146,28 +175,45 @@ func resolve(obs Observation, src Source) (products []Product, cpeVersion, distr
 		}
 		switch c.Part {
 		case "a":
-			add(Canonical(c.Prod())...)
-			if cpeVersion == "" {
-				cpeVersion = c.FullVersion()
-			}
+			appCPEs = append(appCPEs, c)
 		case "o":
-			if d := distroFromOSCPE(c); d != "" && distro == "" {
-				distro = d
-			}
+			osCPEs = append(osCPEs, c)
 		}
+	}
+	seen := map[string]bool{}
+	add := func(version string, ps ...Product) {
+		for _, p := range ps {
+			if p.Product == "" || seen[p.key()] {
+				continue
+			}
+			seen[p.key()] = true
+			targets = append(targets, target{p: p, version: productVersion(p, version)})
+		}
+	}
+	for _, c := range appCPEs {
+		v := NormalizeVersion(c.FullVersion())
+		switch {
+		case v != "" && notAVersion && strings.HasPrefix(raw, v):
+			v = "" // the CPE holds the series of a banner that is not a version
+		case v != "" && obsVersion != "" && strings.HasPrefix(obsVersion, v+"."):
+			v = obsVersion // the CPE truncated the banner's version
+		case v == "" && len(appCPEs) == 1:
+			v = obsVersion // one product: the banner's version is its version
+		}
+		add(v, Canonical(c.Prod())...)
 	}
 	if obs.Product != "" {
 		if ps := AliasProducts(obs.Product); len(ps) > 0 {
-			add(ps...)
-		} else if len(products) == 0 {
+			add(obsVersion, ps...)
+		} else if len(appCPEs) == 0 {
 			// An unknown name is only trusted when NVD publishes that product name
 			// under exactly one vendor; otherwise it is ambiguous and skipped.
 			if p := NormalizeProductName(obs.Product); vendorCount(src, p.Product) == 1 {
-				add(p)
+				add(obsVersion, p)
 			}
 		}
 	}
-	return products, cpeVersion, distro
+	return targets, osCPEs
 }
 
 // lookup returns the records for p that may hold version (all of p's records
@@ -205,18 +251,22 @@ func vendorCount(src Source, product string) int {
 }
 
 // matchEntry decides whether an Entry applies to the observed version.
+//
+// Plain token order follows NVD's conventions (OpenSSH 9.3p1 < 9.3p2, OpenSSL
+// 1.0.1f < 1.0.1g), with one OpenSSH rule: an inclusive upper bound naming a bare
+// release ("<= 7.9") includes that release's portable builds (7.9p1), see
+// portableOnBound. A pinned version must match exactly: NVD pins 9.3 (update "-")
+// and 9.3p1 separately.
 func matchEntry(e Entry, version string) (Candidate, bool) {
 	cand := Candidate{
 		CVE:         e.CVE,
 		Product:     e.Product,
+		Version:     version,
 		Severity:    e.Severity,
 		Score:       e.Score,
 		Vector:      e.Vector,
 		Description: e.Description,
 	}
-	// Plain ordering is right for NVD's conventions: OpenSSH 9.8 < 9.8p1, so the
-	// fix release 9.8p1 falls outside "<= 9.8", and 9.3p2 does not equal the
-	// pinned 9.3 (update "-") or 9.3p1.
 	switch {
 	case e.ExactVersion != "":
 		if version == "" || CompareVersions(version, e.ExactVersion) != 0 {
@@ -225,7 +275,7 @@ func matchEntry(e Entry, version string) (Candidate, bool) {
 		cand.MatchBasis = version + " == " + e.ExactVersion
 		cand.VersionConfirmed = true
 	case e.hasRange():
-		if version == "" || !versionInRange(version, e) {
+		if version == "" || !versionInRange(version, e, e.Product.Product == "openssh") {
 			return Candidate{}, false
 		}
 		cand.MatchBasis = version + " in " + rangeString(e)
@@ -239,14 +289,14 @@ func matchEntry(e Entry, version string) (Candidate, bool) {
 
 // versionInRange reports whether version satisfies the entry's bounds. An absent
 // bound does not constrain that side.
-func versionInRange(version string, e Entry) bool {
+func versionInRange(version string, e Entry, portable bool) bool {
 	if e.StartIncluding != "" && CompareVersions(version, e.StartIncluding) < 0 {
 		return false
 	}
 	if e.StartExcluding != "" && CompareVersions(version, e.StartExcluding) <= 0 {
 		return false
 	}
-	if e.EndIncluding != "" && CompareVersions(version, e.EndIncluding) > 0 {
+	if e.EndIncluding != "" && CompareVersions(version, e.EndIncluding) > 0 && !portableOnBound(version, e.EndIncluding, portable) {
 		return false
 	}
 	if e.EndExcluding != "" && CompareVersions(version, e.EndExcluding) >= 0 {

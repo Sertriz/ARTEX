@@ -44,7 +44,8 @@ type scanIngest struct {
 	// Services are the version/CPE-bearing services seen in this file, for CVE
 	// correlation. The parser only collects them; correlation runs in the tool,
 	// which holds the CVE source. Empty when nothing carried a product or CPE.
-	Services []cveServiceObs
+	Services        []cveServiceObs
+	ServicesDropped int // services past cveServicesPerFile, not collected
 }
 
 func newScanIngest() *scanIngest {
@@ -232,6 +233,7 @@ func (s *scanIngest) addServiceObs(target string, assetIdx int, product, version
 		return
 	}
 	if len(s.Services) >= cveServicesPerFile {
+		s.ServicesDropped++
 		return
 	}
 	s.Services = append(s.Services, cveServiceObs{
