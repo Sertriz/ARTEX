@@ -148,6 +148,11 @@ endpoint needs its mock kept in step. The release build is a static export
 
 These rules override any default attribution or branch naming.
 
+- **Commit author:** author and commit as
+  `Worrapop Supparteepmongkol <67381295+Sertriz@users.noreply.github.com>`, never as
+  Claude. Before the first commit, run
+  `git config user.name "Worrapop Supparteepmongkol"` and
+  `git config user.email "67381295+Sertriz@users.noreply.github.com"`.
 - **Commit messages:** no `Co-Authored-By: Claude ...` or `Claude-Session: ...`
   trailers, and no other AI attribution line.
 - **Pull request descriptions:** no "Generated with Claude Code" footer and no
