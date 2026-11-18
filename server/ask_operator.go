@@ -169,16 +169,21 @@ func stageAskOperatorImage(dataDir, taskID, src string) ([]chatAttachment, error
 		return nil, fmt.Errorf("image_path must be a png/jpg/jpeg/webp/gif file, got %q", filepath.Base(src))
 	}
 	// The copy runs in process as the ARTEX user: hold the source to this task's
-	// directory and the browser MCP's output directory, where screenshots land, so
-	// the operator card cannot carry another file out, a key or another task's
-	// data. A relative path is the browser tool's own report, relative to its
-	// working directory, which is ARTEX's.
+	// directory and to where the browser MCP saves screenshots (its output
+	// directory, or its workspace root, ARTEX's working directory, for a
+	// screenshot given an explicit file name), so the operator card cannot carry
+	// another file out, a key or another task's data. The image extension check
+	// above keeps the working directory to images. A relative path is the browser
+	// tool's own report, relative to that working directory.
 	if !filepath.IsAbs(src) {
 		if abs, err := filepath.Abs(src); err == nil {
 			src = abs
 		}
 	}
 	roots := append([]string{filepath.Join(dataDir, "tasks", taskID)}, browserOutputDirs()...)
+	if wd := workingDir(); wd != "" {
+		roots = append(roots, wd)
+	}
 	src, err := agent.ConfineAgentPath(src, roots...)
 	if err != nil {
 		return nil, fmt.Errorf("image_path refused: %v (attach a browser screenshot or an image inside this task's directory)", err)

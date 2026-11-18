@@ -14,3 +14,11 @@ func linkCount(fi os.FileInfo) uint64 {
 	}
 	return 1
 }
+
+// fileOwner returns the user id owning a file.
+func fileOwner(fi os.FileInfo) (int, bool) {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid), true
+	}
+	return 0, false
+}

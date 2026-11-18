@@ -179,6 +179,16 @@ func TestStageAskOperatorBrowserScreenshot(t *testing.T) {
 			t.Fatalf("%s: att=%v err=%v", p, att, err)
 		}
 	}
+	// A screenshot given an explicit file name lands in the browser MCP's
+	// workspace root, ARTEX's working directory.
+	if err := os.WriteFile(filepath.Join(wd, "login.png"), []byte("fakepng"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"login.png", filepath.Join(wd, "login.png")} {
+		if att, err := stageAskOperatorImage(dir, "7", p); err != nil || len(att) != 1 {
+			t.Fatalf("%s: att=%v err=%v", p, att, err)
+		}
+	}
 	key := filepath.Join(t.TempDir(), "jwt.key")
 	if err := os.WriteFile(key, []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)

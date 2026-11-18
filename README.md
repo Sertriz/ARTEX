@@ -444,19 +444,32 @@ held to:
 - write: the agent's own run directory, and for a task run the task directory
   (`<data>/tasks/<id>`);
 - read: those, plus `<data>/tasks`, `<data>/sessions`, `<data>/drafts`, `<data>/noa`, the skills
-  directory, the SDK's background-task output, the browser MCP's output (`.playwright-mcp` under
-  ARTEX's working directory or the temp directory, or `PLAYWRIGHT_MCP_OUTPUT_DIR`) and the proxy CA
-  certificate;
-- never: `jwt.key` and `secret.key`, the key directory when it holds nothing else, and the proxy
-  CA store (`<data>/traffic/_ca`) except its certificate.
+  directory, the SDK's background-task output (`<tmp>/norma`), the browser MCP's output
+  (`PLAYWRIGHT_MCP_OUTPUT_DIR`, or `.playwright-mcp` under ARTEX's working directory or the temp
+  directory) and the proxy CA certificate;
+- never: `jwt.key` and `secret.key`, the config file (`config.json`, which can hold the database
+  password), the key directory as a whole when it holds none of the directories above, and the proxy
+  CA store (`<data>/traffic/_ca`) except its certificate files.
 
-The check follows symlinks first, and refuses dangling symlinks, hardlinked files and a Grep tree
-that holds a link leading outside. `ingest_bbot` reads only from the task directory, and the
-`ask_operator` screenshot only from the task directory or the browser MCP's output. Unset or empty, the confinement is on; set `ARTEX_FILE_TOOL_CONFINE=0` (or
-`false` / `off` / `no`) to disable it. **Limit:** Bash and the tools it starts still run as the
-ARTEX user (root in the Docker image) and can read anything that user can, `/proc` included; a
-separate agent user is planned as a follow-up. The proxy CA private key
-(`<data>/traffic/_ca/mitmproxy-ca.pem`) is now written `0600` at every start.
+Paths are checked after following symlinks. Dangling symlinks and hardlinked files are refused
+(hardlinks are detected on Unix-like systems only). Grep refuses a search tree that holds a denied
+path, a link to a text file outside the readable directories, or more than 200,000 files. The
+`<tmp>/norma` and browser output directories are used only when they are owned by the ARTEX user and
+not writable by others; a symlink in their place is not followed. A browser output directory that
+contains the data or key directory is ignored.
+
+`ingest_bbot` reads only from the task directory. The `ask_operator` image is read only from the
+task directory, the browser MCP's output, or ARTEX's working directory (where the browser MCP saves
+a screenshot given an explicit file name), and must be a png/jpg/jpeg/webp/gif file.
+
+Unset or empty, the confinement is on; set `ARTEX_FILE_TOOL_CONFINE=0` (or `false` / `off` / `no`)
+to disable it. **Limit:** Bash and the tools it starts still run as the ARTEX user (root in the
+Docker image) and can read anything that user can, `/proc` included; a separate agent user is
+planned as a follow-up.
+
+The proxy CA private key (`<data>/traffic/_ca/mitmproxy-ca.pem`) is set to `0600` at every start,
+also when the recording proxy is off, which tightens keys written by earlier versions. On Windows
+the mode only toggles read-only, so this has no effect there.
 
 **Noise profile (off by default)**: `ARTEX_NOISE_PROFILE` paces the requests ARTEX sends to targets
 (WebFetch, HTTP custom tools, the enrich probe). Unset or `off` keeps today's behaviour: no limit,

@@ -258,18 +258,20 @@ func Open(dir, addr string) (*Traffic, error) {
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
-	restrictCAKey(dir)
+	RestrictCAKey(dir)
 	return t, nil
 }
 
-// restrictCAKey makes the proxy CA private key readable by the ARTEX user only.
-// go-mitmproxy writes its CA store with os.Create, which leaves every file 0644
-// under the usual umask, and mitmproxy-ca.pem holds the private key: whoever
-// reads it can sign a certificate for any host that every client trusting the
-// proxy CA accepts. The certificate files stay readable, since clients must
-// load them. Run on every start, so a key written by an earlier version is
-// tightened too. A failure is logged, not fatal: the proxy still works.
-func restrictCAKey(dir string) {
+// RestrictCAKey makes the proxy CA private key under the traffic dir readable by
+// the ARTEX user only. go-mitmproxy writes its CA store with os.Create, which
+// leaves every file 0644 under the usual umask, and mitmproxy-ca.pem holds the
+// private key: whoever reads it can sign a certificate for any host that every
+// client trusting the proxy CA accepts. The certificate files stay readable,
+// since clients must load them. Open runs it, and the server runs it at startup
+// with the proxy off, so a key written by an earlier version is tightened too.
+// A failure is logged, not fatal: the proxy still works. On Windows the mode
+// bits only toggle the read-only attribute, so this restricts nothing there.
+func RestrictCAKey(dir string) {
 	key := CAKeyPath(dir)
 	if err := os.Chmod(key, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Printf("[traffic] restricting the CA private key %s: %v", key, err)

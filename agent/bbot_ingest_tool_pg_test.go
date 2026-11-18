@@ -151,7 +151,10 @@ func TestIngestBbotConfined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		_ = d.DeleteTask(task.ID)
+		_, _ = d.Exec(`DELETE FROM assets WHERE domain='bbot-confined.example.com'`)
+	})
 	tsx := NewToolSet(d.Exploration(task.ExplorationID), "worker-1")
 	tsx.SetTaskID(task.ID)
 	tsx.SetAssetStore(d.Assets(), d.Companies())
@@ -196,5 +199,23 @@ func TestIngestBbotConfined(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("a refused file was ingested: %d assets", n)
+	}
+
+	// bbot's output inside this task's directory is ingested.
+	own := filepath.Join(data, "tasks", strconv.FormatInt(task.ID, 10), "bbot", "output.json")
+	if err := os.MkdirAll(filepath.Dir(own), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte(`{"type":"DNS_NAME","data":"bbot-confined.example.com","host":"bbot-confined.example.com","scope_distance":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := call(ctx, own); res.IsError {
+		t.Fatalf("own task file: %s", res.Flatten())
+	}
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE domain='bbot-confined.example.com'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("own task file: %d assets, want 1", n)
 	}
 }
