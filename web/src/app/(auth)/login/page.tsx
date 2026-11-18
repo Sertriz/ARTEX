@@ -11,7 +11,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
 export default function LoginPage() {
@@ -71,8 +71,10 @@ export default function LoginPage() {
       const { token } = await api.login("ARTEX", password);
       auth.setToken(token);
       window.location.replace("/function/tasks");
-    } catch {
-      setError("Incorrect username or password");
+    } catch (err) {
+      // A 401 is a wrong password. Anything else the server answered (429 with
+      // its Retry-After wait, 503, ...) is shown as the server worded it.
+      setError(err instanceof ApiError && err.status !== 401 ? err.message : "Incorrect username or password");
     } finally {
       setLoading(false);
     }
