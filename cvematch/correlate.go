@@ -138,7 +138,7 @@ func CorrelateResult(obs Observation, src Source) Result {
 	best := map[string]Candidate{}
 	for _, t := range targets {
 		for _, e := range lookup(src, t.p, t.version) {
-			if contradicts(e.Platforms, res.Platform) {
+			if contradicts(e.Platforms, res.Platform, distro) {
 				continue
 			}
 			cand, ok := matchEntry(e, t.version)
@@ -146,7 +146,7 @@ func CorrelateResult(obs Observation, src Source) Result {
 				continue
 			}
 			cand.BackportRisk = cand.VersionConfirmed && distro != ""
-			if res.Platform == 0 {
+			if conditional(e.Platforms, res.Platform, distro) {
 				cand.Platforms = e.Platforms
 			}
 			if cur, exists := best[cand.CVE]; !exists || better(cand, cur) {
@@ -274,10 +274,11 @@ func vendorCount(src Source, product string) int {
 // matchEntry decides whether an Entry applies to the observed version.
 //
 // Plain token order follows NVD's conventions (OpenSSH 9.3p1 < 9.3p2, OpenSSL
-// 1.0.1f < 1.0.1g), with one OpenSSH rule: an inclusive upper bound naming a bare
-// release ("<= 7.9") includes that release's portable builds (7.9p1), see
-// portableOnBound. A pinned version must match exactly: NVD pins 9.3 (update "-")
-// and 9.3p1 separately.
+// 1.0.1f < 1.0.1g), with one OpenSSH rule: an inclusive upper bound or a pin with
+// update ANY that names a bare release ("<= 7.9", "8.2:*") includes that
+// release's portable builds (7.9p1, 8.2p1), see portableOnBound. Otherwise a
+// pinned version must match exactly: NVD pins 9.3 (update "-") and 9.3p1
+// separately. A record limited to an edition needs the version to show it.
 func matchEntry(e Entry, version string) (Candidate, bool) {
 	cand := Candidate{
 		CVE:         e.CVE,
@@ -288,15 +289,25 @@ func matchEntry(e Entry, version string) (Candidate, bool) {
 		Vector:      e.Vector,
 		Description: e.Description,
 	}
+	if e.Edition != "" && !editionShown(e.Product.Product, version) {
+		return Candidate{}, false
+	}
+	portable := e.Product.Product == "openssh"
 	switch {
 	case e.ExactVersion != "":
-		if version == "" || CompareVersions(version, e.ExactVersion) != 0 {
+		switch {
+		case version == "":
+			return Candidate{}, false
+		case CompareVersions(version, e.ExactVersion) == 0:
+			cand.MatchBasis = version + " == " + e.ExactVersion
+		case e.AnyUpdate && portableOnBound(version, e.ExactVersion, portable):
+			cand.MatchBasis = version + " is a portable build of " + e.ExactVersion
+		default:
 			return Candidate{}, false
 		}
-		cand.MatchBasis = version + " == " + e.ExactVersion
 		cand.VersionConfirmed = true
 	case e.hasRange():
-		if version == "" || !versionInRange(version, e, e.Product.Product == "openssh") {
+		if version == "" || !versionInRange(version, e, portable) {
 			return Candidate{}, false
 		}
 		cand.MatchBasis = version + " in " + rangeString(e)

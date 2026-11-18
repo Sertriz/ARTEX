@@ -40,6 +40,14 @@ type Entry struct {
 	// Platforms is set when NVD limits the record to a platform (an AND
 	// configuration such as "php:php ... running on o:microsoft:windows").
 	Platforms PlatformSet
+
+	// AnyUpdate is set on a pinned version whose CPE update is ANY ("8.2:*"):
+	// for OpenSSH it covers the portable releases of that version (8.2p1).
+	AnyUpdate bool
+	// Edition names the software edition the record is limited to when that
+	// edition shows in the version string (BIND's "supported_preview" builds report
+	// "9.11.4-S1"); "" when the record has no such limit. See editionRules.
+	Edition string
 }
 
 func (e Entry) hasRange() bool {
@@ -93,7 +101,12 @@ const (
 	fStartExcl
 	fEndIncl
 	fEndExcl
+	fAnyUpdate // an exact pin whose CPE update is ANY
+	fEdition   // limited to the edition editionRules names for the product
 )
+
+// fConstraint masks the version constraints: a record with none is unbounded.
+const fConstraint = fExact | fStartIncl | fStartExcl | fEndIncl | fEndExcl
 
 // rec is one vulnerable cpeMatch in 16 bytes: the full NVD feed holds millions.
 // meta indexes the CVE's shared data, the vendor and product are the index keys,
@@ -122,6 +135,10 @@ func (t *tables) entry(r rec, p Product) Entry {
 		Vector:      m.vector,
 		Description: m.desc,
 		Platforms:   r.plat,
+		AnyUpdate:   r.flags&fAnyUpdate != 0,
+	}
+	if r.flags&fEdition != 0 {
+		e.Edition = editionRules[p.Product].edition
 	}
 	switch {
 	case r.flags&fExact != 0:
@@ -205,7 +222,7 @@ func (s *NVDSource) Match(p Product, version string) []Entry {
 	emit := func(vendor string, recs []rec) {
 		pr := Product{Vendor: vendor, Product: p.Product}
 		for _, r := range recs {
-			if s.holds(r, version, vt, portable) {
+			if s.holds(r, p.Product, version, vt, portable) {
 				out = append(out, s.entry(r, pr))
 			}
 		}
@@ -222,10 +239,15 @@ func (s *NVDSource) Match(p Product, version string) []Entry {
 }
 
 // holds reports whether the record's constraint admits the version (tokenized as
-// vt): a pinned version must be equal, a range must contain it, and an unbounded
-// record admits anything. An empty version only satisfies an unbounded record.
-func (t *tables) holds(r rec, version string, vt []token, portable bool) bool {
-	if r.flags == 0 {
+// vt) of product: a pinned version must be equal (or, for OpenSSH and a pin with
+// update ANY, be a portable build of it, see portableOnBound), a range must contain it, and an unbounded record
+// admits anything. An empty version only satisfies an unbounded record. A record
+// limited to an edition also needs the version to show that edition.
+func (t *tables) holds(r rec, product, version string, vt []token, portable bool) bool {
+	if r.flags&fEdition != 0 && !editionShown(product, version) {
+		return false
+	}
+	if r.flags&fConstraint == 0 {
 		return true
 	}
 	if version == "" {
@@ -233,7 +255,8 @@ func (t *tables) holds(r rec, version string, vt []token, portable bool) bool {
 	}
 	lo, hi := t.versions[r.lo], t.versions[r.hi]
 	if r.flags&fExact != 0 {
-		return compareTokens(vt, versionTokens(lo)) == 0
+		return compareTokens(vt, versionTokens(lo)) == 0 ||
+			r.flags&fAnyUpdate != 0 && portableOnBound(version, lo, portable)
 	}
 	if r.flags&fStartIncl != 0 && compareTokens(vt, versionTokens(lo)) < 0 {
 		return false
@@ -632,6 +655,12 @@ func (l *loader) add(c nvdCVE) {
 				case cpe.FullVersion() != "":
 					r.flags = fExact
 					r.lo = l.version(cpe.FullVersion())
+					if cpe.UpdateAny {
+						r.flags |= fAnyUpdate
+					}
+				}
+				if rule, ok := editionRules[cpe.Product]; ok && rule.vendor == cpe.Vendor && rule.edition == cpe.SWEdition {
+					r.flags |= fEdition
 				}
 				applyErrata(id, cpe, &r, l.versions)
 				product, vendor := l.str(cpe.Product), l.str(cpe.Vendor)
@@ -650,11 +679,16 @@ func (l *loader) add(c nvdCVE) {
 // records to: the families of the CPEs in its nodes that hold no vulnerable match
 // (NVD's "running on" nodes, such as o:microsoft:windows for CVE-2024-4577). A
 // plain configuration, or one that negates, restricts nothing.
+//
+// When every Linux platform named is a known distribution, the record also keeps
+// their lineages (CVE-2026-123158 is OpenSSH "on Alpine Linux" only); a generic
+// Linux platform (linux_kernel) among them means any distribution.
 func configPlatform(cfg nvdConfigNode) PlatformSet {
 	if !strings.EqualFold(cfg.Operator, "AND") || cfg.Negate {
 		return 0
 	}
 	var plat PlatformSet
+	genericLinux := false
 	for _, n := range cfg.Nodes {
 		vulnerable := false
 		for _, m := range n.CPEMatch {
@@ -668,11 +702,16 @@ func configPlatform(cfg nvdConfigNode) PlatformSet {
 		}
 		for _, m := range n.CPEMatch {
 			if c, ok := ParseCPEName(m.Criteria); ok {
-				plat |= platformOf(c)
+				p := platformOf(c)
+				genericLinux = genericLinux || p&PlatformLinux != 0 && p&platformDistros == 0
+				plat |= p
 			} else {
 				plat |= PlatformOther
 			}
 		}
+	}
+	if genericLinux {
+		plat &^= platformDistros
 	}
 	return plat
 }
@@ -707,15 +746,43 @@ func applyErrata(id string, cpe CPE, r *rec, versions []string) {
 }
 
 // portableOnBound reports whether an OpenSSH portable release sits on an
-// inclusive upper bound that names the bare release: NVD writes "<= 7.9" for
-// "through release 7.9", which includes the portable 7.9p1 every Linux sshd
-// reports (CVE-2019-6111, CVE-2018-15473 "<= 7.7", CVE-2016-20012 "<= 8.7").
+// inclusive upper bound, or a pin with update ANY, that names the bare release:
+// NVD writes "<= 7.9" for "through release 7.9", which includes the portable
+// 7.9p1 every Linux sshd reports (CVE-2019-6111, CVE-2018-15473 "<= 7.7",
+// CVE-2016-20012 "<= 8.7"), and pins "8.2:*" for "OpenSSH 8.2", which includes
+// 8.2p1 (CVE-2020-12062, CVE-2023-25136 "9.1:*"). A pin with update NA ("9.3:-")
+// is the bare release only: CVE-2023-38408 pins 9.3:- and 9.3:p1 separately.
 func portableOnBound(version, bound string, portable bool) bool {
 	if !portable || portableSuffixRe.MatchString(bound) {
 		return false
 	}
 	base := stripPortable(version)
 	return base != version && CompareVersions(base, bound) == 0
+}
+
+// editionRule limits a product's records with one CPE sw_edition to the builds
+// whose version string shows that edition.
+type editionRule struct {
+	vendor, edition string
+	marker          *regexp.Regexp // matches the observed version of that edition
+}
+
+// editionRules lists the editions a version string tells apart, keyed by product.
+// NVD files most editions (nginx "open_source", BIND "esv", Splunk "enterprise")
+// beside records for the same releases, or for products that print no edition, so
+// only an edition the banner shows is enforced: ISC's BIND Supported Preview
+// builds report "9.11.4-S1" (a CPE update "s1" joins as "9.11.4s1"), and their
+// records (CVE-2026-10723 "9.11.3 to 9.18.50, supported_preview") do not apply to
+// the open-source 9.11.4.
+var editionRules = map[string]editionRule{
+	"bind": {vendor: "isc", edition: "supported_preview", marker: regexp.MustCompile(`[0-9]-?s[0-9]+([-._]|$)`)},
+}
+
+// editionShown reports whether the observed version of product shows the edition
+// its rule names. An empty version shows none.
+func editionShown(product, version string) bool {
+	rule, ok := editionRules[product]
+	return ok && rule.marker.MatchString(strings.ToLower(version))
 }
 
 // finish drops superseded/rejected records, trims every bucket to its size and

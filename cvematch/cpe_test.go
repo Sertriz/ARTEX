@@ -201,8 +201,11 @@ func TestPlatforms(t *testing.T) {
 	if got := platformOf(cpe("cpe:2.3:o:microsoft:windows:-:*:*:*:*:*:*:*")); got != PlatformWindows {
 		t.Errorf("windows = %v", got)
 	}
-	if got := platformOf(cpe("cpe:2.3:o:canonical:ubuntu_linux:22.04:*:*:*:*:*:*:*")); got != PlatformLinux {
+	if got := platformOf(cpe("cpe:2.3:o:canonical:ubuntu_linux:22.04:*:*:*:*:*:*:*")); got != PlatformLinux|PlatformDebian {
 		t.Errorf("ubuntu = %v", got)
+	}
+	if got := platformOf(cpe("cpe:2.3:o:linux:linux_kernel:-:*:*:*:*:*:*:*")); got != PlatformLinux {
+		t.Errorf("linux kernel = %v", got)
 	}
 	if got := platformOf(cpe("cpe:2.3:h:cisco:asa_5505:-:*:*:*:*:*:*:*")); got != PlatformOther {
 		t.Errorf("cisco = %v", got)
@@ -226,10 +229,75 @@ func TestPlatforms(t *testing.T) {
 			t.Errorf("%s: observedPlatform = %v, want %v", c.name, got, c.want)
 		}
 	}
-	if !contradicts(PlatformWindows, PlatformLinux) || !contradicts(PlatformWindows, platformUnix) {
+	if got := observedPlatform([]CPE{cpe("cpe:/o:alpinelinux:alpine_linux")}, "alpine"); got != PlatformLinux {
+		t.Errorf("an observed distro must not carry lineage bits: %v", got)
+	}
+	if !contradicts(PlatformWindows, PlatformLinux, "") || !contradicts(PlatformWindows, platformUnix, "") {
 		t.Error("a Windows-only record must not apply to a Linux/Unix host")
 	}
-	if contradicts(PlatformWindows, 0) || contradicts(0, PlatformLinux) || contradicts(PlatformWindows|PlatformOther, PlatformLinux) || contradicts(PlatformWindows, PlatformWindows) {
+	if contradicts(PlatformWindows, 0, "") || contradicts(0, PlatformLinux, "") || contradicts(PlatformWindows|PlatformOther, PlatformLinux, "") || contradicts(PlatformWindows, PlatformWindows, "") {
 		t.Error("unknown, unrestricted, other-platform and matching cases must not contradict")
+	}
+}
+
+// TestDistroPlatforms covers records NVD limits to Linux distributions.
+func TestDistroPlatforms(t *testing.T) {
+	alpine := PlatformLinux | PlatformAlpine
+	cases := []struct {
+		rec, obs                 PlatformSet
+		distro                   string
+		contradicts, conditional bool
+	}{
+		{alpine, PlatformLinux, "ubuntu", true, false},  // another distribution
+		{alpine, PlatformLinux, "rocky", true, false},   // another lineage
+		{alpine, PlatformLinux, "alpine", false, false}, // the distribution named
+		{alpine, PlatformLinux, "", false, true},        // Linux, distribution unknown
+		{alpine, 0, "", false, true},                    // nothing known
+		{alpine, PlatformWindows, "", true, false},      // another family
+		{alpine, platformUnix, "", false, true},         // "(Unix)": maybe Alpine
+		{alpine, PlatformBSD, "freebsd", true, false},
+		// Lineages: a record for RHEL holds on Rocky, one for Debian on Ubuntu.
+		{PlatformLinux | PlatformRedHat, PlatformLinux, "rocky", false, false},
+		{PlatformLinux | PlatformDebian, PlatformLinux, "ubuntu", false, false},
+		{PlatformLinux | PlatformDebian | PlatformRedHat, PlatformLinux, "fedora", false, false},
+		// A family-only record is unchanged by the distribution.
+		{PlatformLinux, PlatformLinux, "ubuntu", false, false},
+		{PlatformWindows, 0, "", false, true},
+	}
+	for _, c := range cases {
+		if got := contradicts(c.rec, c.obs, c.distro); got != c.contradicts {
+			t.Errorf("contradicts(%v, %v, %q) = %v", c.rec.Names(), c.obs.Names(), c.distro, got)
+		}
+		if got := conditional(c.rec, c.obs, c.distro); got != c.conditional {
+			t.Errorf("conditional(%v, %v, %q) = %v", c.rec.Names(), c.obs.Names(), c.distro, got)
+		}
+	}
+	if got := alpine.Names(); len(got) != 1 || got[0] != "alpine" {
+		t.Errorf("names = %v, want [alpine]", got)
+	}
+	if got := (PlatformLinux | PlatformDebian | PlatformRedHat).Names(); len(got) != 2 || got[0] != "debian" || got[1] != "redhat" {
+		t.Errorf("names = %v, want [debian redhat]", got)
+	}
+}
+
+func TestParseCPEUpdateAndEdition(t *testing.T) {
+	cases := []struct {
+		in        string
+		update    string
+		updateAny bool
+		edition   string
+	}{
+		{"cpe:2.3:a:openbsd:openssh:8.2:*:*:*:*:*:*:*", "", true, ""},
+		{"cpe:2.3:a:openbsd:openssh:9.3:-:*:*:*:*:*:*", "", false, ""},
+		{"cpe:2.3:a:openbsd:openssh:9.3:p1:*:*:*:*:*:*", "p1", false, ""},
+		{"cpe:2.3:a:isc:bind:*:*:*:*:supported_preview:*:*:*", "", true, "supported_preview"},
+		{"cpe:2.3:a:isc:bind:*:*:*:*:-:*:*:*", "", true, ""},
+		{"cpe:/a:openbsd:openssh:8.2p1", "", true, ""},
+	}
+	for _, c := range cases {
+		got, ok := ParseCPEName(c.in)
+		if !ok || got.Update != c.update || got.UpdateAny != c.updateAny || got.SWEdition != c.edition {
+			t.Errorf("%s: update %q any %v edition %q", c.in, got.Update, got.UpdateAny, got.SWEdition)
+		}
 	}
 }

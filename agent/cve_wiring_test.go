@@ -116,7 +116,9 @@ func TestCVEWiringEndToEnd(t *testing.T) {
 	}
 	expect := []string{
 		// Both Ubuntu hosts run the same OpenSSH build: one fact, two anchors.
-		"CVE lead (unverified): openbsd:openssh 8.2p1 — CVE-2023-38408, CVE-2021-41617 +1 (1 critical, 1 high); ubuntu build, fixes may be backported; on 198.51.100.10:22/tcp +1 more",
+		// CVE-2020-12062 is pinned "8.2:*" (8.2p1 included); CVE-2026-123158 is
+		// Alpine only and does not apply to Ubuntu.
+		"CVE lead (unverified): openbsd:openssh 8.2p1 — CVE-2023-38408, CVE-2020-12062 +2 (1 critical, 2 high); ubuntu build, fixes may be backported; on 198.51.100.10:22/tcp +1 more",
 		"CVE lead (unverified): vsftpd_project:vsftpd 2.3.4 — CVE-2011-2523 (1 critical, 0 high); on 198.51.100.10:21/tcp",
 		"CVE lead (unverified): f5:nginx 1.18.0 — CVE-2021-23017",
 	}
