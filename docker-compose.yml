@@ -41,6 +41,9 @@ services:
       # Untrusted-output boundary: on by default (empty = on); ARTEX_UNTRUSTED_BOUNDARY=0 in .env
       # disables it. Cost: about 154 bytes per tool result plus one system note.
       ARTEX_UNTRUSTED_BOUNDARY: ${ARTEX_UNTRUSTED_BOUNDARY:-}
+      # Agent file tools confined to run/task/session/skill files: on by default (empty = on);
+      # ARTEX_FILE_TOOL_CONFINE=0 in .env disables it.
+      ARTEX_FILE_TOOL_CONFINE: ${ARTEX_FILE_TOOL_CONFINE:-}
       ARTEX_UPDATE_CHECK: ${ARTEX_UPDATE_CHECK:-}
       # Noise profile for target requests: off (default) | quiet | balanced | aggressive.
       ARTEX_NOISE_PROFILE: ${ARTEX_NOISE_PROFILE:-}

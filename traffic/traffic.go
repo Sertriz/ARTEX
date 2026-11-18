@@ -258,7 +258,35 @@ func Open(dir, addr string) (*Traffic, error) {
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	restrictCAKey(dir)
 	return t, nil
+}
+
+// restrictCAKey makes the proxy CA private key readable by the ARTEX user only.
+// go-mitmproxy writes its CA store with os.Create, which leaves every file 0644
+// under the usual umask, and mitmproxy-ca.pem holds the private key: whoever
+// reads it can sign a certificate for any host that every client trusting the
+// proxy CA accepts. The certificate files stay readable, since clients must
+// load them. Run on every start, so a key written by an earlier version is
+// tightened too. A failure is logged, not fatal: the proxy still works.
+func restrictCAKey(dir string) {
+	key := CAKeyPath(dir)
+	if err := os.Chmod(key, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Printf("[traffic] restricting the CA private key %s: %v", key, err)
+	}
+}
+
+// CAKeyPath returns the file of the proxy CA private key under a traffic dir.
+// Nothing outside the proxy may read it.
+func CAKeyPath(dir string) string { return filepath.Join(dir, "_ca", "mitmproxy-ca.pem") }
+
+// CADir returns the proxy CA store of this traffic tree.
+func (t *Traffic) CADir() string { return filepath.Join(t.dir, "_ca") }
+
+// CACertFiles returns the CA certificate files of the store (PEM and DER), which
+// clients load to trust the proxy. They hold no key.
+func (t *Traffic) CACertFiles() []string {
+	return []string{t.CACertPath(), filepath.Join(t.dir, "_ca", "mitmproxy-ca-cert.cer")}
 }
 
 // initIndex applies the schema on a single pinned connection. Pinning is what

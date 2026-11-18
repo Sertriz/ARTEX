@@ -262,6 +262,9 @@ worker remains confined to the intent it claimed.
 - **Untrusted-output boundary (on by default)**: tool results are framed between nonce-tagged
   markers so the model treats them as data, not instructions. Disable with
   `ARTEX_UNTRUSTED_BOUNDARY=0`.
+- **File-tool confinement (on by default)**: the agents' file tools (Read, Write, Edit, LS, Glob,
+  Grep) reach only the run, task, session and skill files, never ARTEX's keys or the proxy CA
+  key. Disable with `ARTEX_FILE_TOOL_CONFINE=0`. Shell commands are not confined.
 
 ### Assets and coverage
 
@@ -433,6 +436,27 @@ runtime supports it.
 agent are framed between nonce-tagged markers so the model treats them as data, not instructions.
 Unset or empty, the boundary is on; set `ARTEX_UNTRUSTED_BOUNDARY=0` (or `false` / `off` / `no`) to
 disable it. Cost: about 154 bytes per tool result plus one system note.
+
+**File-tool confinement (on by default)**: the file tools of every agent (Read, Write, Edit,
+MultiEdit, LS, Glob, Grep) run inside the ARTEX process and used to accept any path. They are now
+held to:
+
+- write: the agent's own run directory, and for a task run the task directory
+  (`<data>/tasks/<id>`);
+- read: those, plus `<data>/tasks`, `<data>/sessions`, `<data>/drafts`, `<data>/noa`, the skills
+  directory, the SDK's background-task output, the browser MCP's output (`.playwright-mcp` under
+  ARTEX's working directory or the temp directory, or `PLAYWRIGHT_MCP_OUTPUT_DIR`) and the proxy CA
+  certificate;
+- never: `jwt.key` and `secret.key`, the key directory when it holds nothing else, and the proxy
+  CA store (`<data>/traffic/_ca`) except its certificate.
+
+The check follows symlinks first, and refuses dangling symlinks, hardlinked files and a Grep tree
+that holds a link leading outside. `ingest_bbot` reads only from the task directory, and the
+`ask_operator` screenshot only from the task directory or the browser MCP's output. Unset or empty, the confinement is on; set `ARTEX_FILE_TOOL_CONFINE=0` (or
+`false` / `off` / `no`) to disable it. **Limit:** Bash and the tools it starts still run as the
+ARTEX user (root in the Docker image) and can read anything that user can, `/proc` included; a
+separate agent user is planned as a follow-up. The proxy CA private key
+(`<data>/traffic/_ca/mitmproxy-ca.pem`) is now written `0600` at every start.
 
 **Noise profile (off by default)**: `ARTEX_NOISE_PROFILE` paces the requests ARTEX sends to targets
 (WebFetch, HTTP custom tools, the enrich probe). Unset or `off` keeps today's behaviour: no limit,
@@ -737,6 +761,9 @@ Operational security properties:
 - **Login protection**: 10 attempts per minute per client IP, with `ARTEX_TRUSTED_PROXIES` for
   correct client attribution behind a reverse proxy.
 - **Untrusted tool output**: framed as data for every agent by default (prompt-injection boundary).
+- **Agent file tools**: confined to the run, task, session and skill files by default, never the
+  key files or the proxy CA key (`ARTEX_FILE_TOOL_CONFINE`). Shell commands are not confined: an
+  agent's Bash runs as the ARTEX user.
 - **Release integrity**: SHA-256 sums, CycloneDX SBOM and GitHub build provenance attestations for
   release archives.
 

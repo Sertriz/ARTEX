@@ -169,6 +169,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	for _, o := range opts {
 		o(s)
 	}
+	installFileToolPolicy(m, skillDir, dataDir, keyDir)
 	s.initSetupToken()
 	s.initSideQuestions()
 	if m != nil {

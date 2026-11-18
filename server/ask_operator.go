@@ -37,7 +37,7 @@ func (s *Server) toolAskOperator() actool.CoreTool {
 				},
 				"image_path": map[string]any{
 					"type":        "string",
-					"description": "Optional path to a screenshot (png/jpg/jpeg/webp/gif, max 10MB), e.g. the browser_take_screenshot output. It is copied into the task uploads and shown to the operator.",
+					"description": "Optional path to a screenshot (png/jpg/jpeg/webp/gif, max 10MB): the browser_take_screenshot output as the browser tool reported it, or an image inside this task's directory. It is copied into the task uploads and shown to the operator.",
 				},
 			},
 			"required": []any{"question"},
@@ -167,6 +167,21 @@ func stageAskOperatorImage(dataDir, taskID, src string) ([]chatAttachment, error
 	ext := strings.ToLower(filepath.Ext(src))
 	if !askOperatorImageExt[ext] {
 		return nil, fmt.Errorf("image_path must be a png/jpg/jpeg/webp/gif file, got %q", filepath.Base(src))
+	}
+	// The copy runs in process as the ARTEX user: hold the source to this task's
+	// directory and the browser MCP's output directory, where screenshots land, so
+	// the operator card cannot carry another file out, a key or another task's
+	// data. A relative path is the browser tool's own report, relative to its
+	// working directory, which is ARTEX's.
+	if !filepath.IsAbs(src) {
+		if abs, err := filepath.Abs(src); err == nil {
+			src = abs
+		}
+	}
+	roots := append([]string{filepath.Join(dataDir, "tasks", taskID)}, browserOutputDirs()...)
+	src, err := agent.ConfineAgentPath(src, roots...)
+	if err != nil {
+		return nil, fmt.Errorf("image_path refused: %v (attach a browser screenshot or an image inside this task's directory)", err)
 	}
 	st, err := os.Stat(src)
 	if err != nil {
