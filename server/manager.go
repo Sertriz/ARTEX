@@ -18,6 +18,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/artex/cvematch"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/enrich"
@@ -498,10 +499,34 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	loadCVEFeed()
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
 	return m, nil
+}
+
+// loadCVEFeed installs the CVE correlation source from the NVD feed directory in
+// ARTEX_CVE_FEED_DIR, when set. The feature is off unless a feed loads: an unset
+// var, an unreadable directory, or a directory with no usable product index leaves
+// no source installed and scan ingestion behaves exactly as before. The feed is
+// NVD CVE API 2.0 JSON files, synced out-of-band by the operator.
+func loadCVEFeed() {
+	dir := strings.TrimSpace(os.Getenv("ARTEX_CVE_FEED_DIR"))
+	if dir == "" {
+		return
+	}
+	src, files, skipped, err := cvematch.LoadNVDDir(dir)
+	if err != nil {
+		log.Printf("[cve] feed dir %q not loaded: %v", dir, err)
+		return
+	}
+	if src.Len() == 0 {
+		log.Printf("[cve] feed dir %q loaded %d file(s) (%d skipped) but indexed no products; correlation stays off", dir, files, skipped)
+		return
+	}
+	agent.SetCVESource(src)
+	log.Printf("[cve] correlation on: indexed %d product(s) from %d file(s) in %q (%d skipped)", src.Len(), files, dir, skipped)
 }
 
 // TrafficEnabled reports whether traffic capture is on (default off). When off,

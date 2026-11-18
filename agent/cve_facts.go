@@ -6,9 +6,57 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/cvematch"
 )
+
+// The CVE knowledge source is installed once at startup (by the server, from a
+// configured NVD feed). It is read-only after install and guarded like the other
+// agent hooks. When no source is installed the feature is simply off: correlation
+// runs nowhere and nothing changes. Installing a source IS the opt-in.
+var (
+	cveSourceMu   sync.RWMutex
+	cveSourceHook cvematch.Source
+)
+
+// SetCVESource installs (or, with nil, removes) the CVE knowledge source.
+func SetCVESource(s cvematch.Source) {
+	cveSourceMu.Lock()
+	cveSourceHook = s
+	cveSourceMu.Unlock()
+}
+
+// cveSource returns the installed source, or nil when the feature is off.
+func cveSource() cvematch.Source {
+	cveSourceMu.RLock()
+	defer cveSourceMu.RUnlock()
+	return cveSourceHook
+}
+
+// cveServiceObs is one service to correlate: an observation (CPEs/product/version)
+// plus a human descriptor kept only inside the inert fact detail.
+type cveServiceObs struct {
+	Desc string
+	Obs  cvematch.Observation
+}
+
+// cveFactsFromServices correlates every service observation against src and returns
+// one consolidated third_party_intel fact per service that has at least one
+// candidate CVE. It writes nothing; the caller routes the facts through the normal
+// fact-write path (which dedups). A service with no candidates yields no fact.
+func cveFactsFromServices(svcs []cveServiceObs, src cvematch.Source) []factItem {
+	if src == nil || len(svcs) == 0 {
+		return nil
+	}
+	var facts []factItem
+	for _, s := range svcs {
+		if f, _, ok := correlateServiceToFact(s.Obs, s.Desc, 0, 0, src); ok {
+			facts = append(facts, f)
+		}
+	}
+	return facts
+}
 
 // CVE correlation bridge. It turns cvematch candidates for one service into an
 // exploration fact (source third_party_intel) plus a few verification hints, so the
