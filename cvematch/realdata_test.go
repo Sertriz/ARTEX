@@ -21,10 +21,13 @@ import (
 //     BIND "*:s1", CVE-2008-7265 ProFTPD "*:rc2") and CVE-2006-5051, an OpenSSH
 //     "before 4.4" filed as "<= 4.4" (an erratum).
 //   - real-sample-4.jsonl: OpenSSH pins with update ANY (CVE-2020-12062 "8.2:*",
-//     CVE-2023-25136 "9.1:*"), BIND Supported Preview ranges (CVE-2026-10723,
-//     sw_edition "supported_preview"), an OpenSSH record limited to Alpine Linux
-//     (CVE-2026-123158), and ProFTPD's "1.3.5:*" pin fixed in 1.3.5a
-//     (CVE-2015-3306).
+//     CVE-2023-25136 "9.1:*"), and beside a portable pin of the same release
+//     (CVE-2016-0777 "7.1:*" and "7.1:p1", CVE-2003-0787 "3.7.1:*" and
+//     "3.7.1p1:*"), BIND Supported Preview ranges (CVE-2026-10723, CVE-2023-2829
+//     "9.16.8-S1 through 9.16.41-S1"), records limited to distributions
+//     (CVE-2026-123158 OpenSSH on Alpine Linux, CVE-2015-1565 on Windows,
+//     novell:opensuse or RHEL, CVE-2007-5795 with a Debian-only and a plain
+//     configuration), and ProFTPD's "1.3.5:*" pin fixed in 1.3.5a (CVE-2015-3306).
 //   - CVE-2024-6387.json.gz: the full, untrimmed regreSSHion record, gzipped.
 func loadRealData(t *testing.T) *NVDSource {
 	t.Helper()
@@ -32,8 +35,8 @@ func loadRealData(t *testing.T) *NVDSource {
 	if err != nil {
 		t.Fatalf("load testdata: %v", err)
 	}
-	if st := src.Stats(); st.Files != 5 || st.ErrorFiles != 0 || st.CVEs != 27 {
-		t.Fatalf("testdata stats %+v, want 5 files and 27 CVEs", st)
+	if st := src.Stats(); st.Files != 5 || st.ErrorFiles != 0 || st.CVEs != 32 {
+		t.Fatalf("testdata stats %+v, want 5 files and 32 CVEs", st)
 	}
 	return src
 }
@@ -160,7 +163,8 @@ func equal(a, b []string) bool {
 func TestMatchAgreesWithLookup(t *testing.T) {
 	src := loadRealData(t)
 	versions := []string{"", "1.0", "1.0.1f", "2.4.49", "6.2", "8.2", "8.2p1", "8.5p1", "9.1p1", "9.3p1", "9.3p2", "9.8", "9.8p1",
-		"12.2.1.3.0", "1.20.0", "1.3.5", "1.3.5a", "9.11.4", "9.11.4-s1", "9.18.24", "9.20.10-s1"}
+		"12.2.1.3.0", "1.20.0", "1.3.5", "1.3.5a", "9.11.4", "9.11.4-s1", "9.18.24", "9.20.10-s1", "7.1p1", "7.1p2",
+		"3.7.1p2", "9.16.41-s1", "9.16.42-s1", "9.18.15s1", "22.1", "8.1.1"}
 	for product, vendors := range src.byProduct {
 		for vendor := range vendors {
 			p := Product{Vendor: vendor, Product: product}
@@ -260,6 +264,13 @@ func TestRealDataUpdateAnyPins(t *testing.T) {
 		{ssh("8.3p1"), "CVE-2020-12062", false},
 		{ssh("8.1p1"), "CVE-2020-12062", false},
 		{ssh("9.1p1"), "CVE-2023-25136", true},
+		// The CVE pins 7.1:* beside 7.1:p1 and is fixed in 7.1p2: there "*" is
+		// the bare release.
+		{ssh("7.1"), "CVE-2016-0777", true},
+		{ssh("7.1p1"), "CVE-2016-0777", true},
+		{ssh("7.1p2"), "CVE-2016-0777", false},
+		{ssh("3.7.1p1"), "CVE-2003-0787", true},
+		{ssh("3.7.1p2"), "CVE-2003-0787", false},
 		{ssh("9.2p1"), "CVE-2023-25136", false},
 		{ssh("9.3p1"), "CVE-2023-38408", true}, // pinned 9.3:p1
 		{ssh("9.3p2"), "CVE-2023-38408", false},
@@ -300,13 +311,25 @@ func TestRealDataEditionLimited(t *testing.T) {
 		{bind("9.18.51"), false},
 		{Observation{Product: "ISC BIND", Version: "9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.13"}, false},
 	}
-	for _, c := range cases {
-		var got bool
-		for _, cand := range CorrelateResult(c.obs, src).Confirmed() {
-			got = got || cand.CVE == "CVE-2026-10723"
+	matched := func(obs Observation, cve string) bool {
+		for _, cand := range CorrelateResult(obs, src).Confirmed() {
+			if cand.CVE == cve {
+				return true
+			}
 		}
-		if got != c.want {
-			t.Errorf("bind %s: CVE-2026-10723 matched = %v, want %v", c.obs.Version, got, c.want)
+		return false
+	}
+	for _, c := range cases {
+		if got := matched(c.obs, "CVE-2026-10723"); got != c.want {
+			t.Errorf("bind %s %v: CVE-2026-10723 matched = %v, want %v", c.obs.Version, c.obs.CPEs, got, c.want)
+		}
+	}
+	// "9.16.8-S1 through 9.16.41-S1" is filed with bare bounds: the edition
+	// build of the last release is inside, the next release is not.
+	for v, want := range map[string]bool{"9.16.41-S1": true, "9.16.8-S1": true, "9.16.42-S1": false, "9.16.7-S1": false,
+		"9.16.41": false, "9.18.15-S1": true, "9.18.16-S1": false} {
+		if got := matched(bind(v), "CVE-2023-2829"); got != want {
+			t.Errorf("bind %s: CVE-2023-2829 matched = %v, want %v", v, got, want)
 		}
 	}
 }
@@ -338,6 +361,10 @@ func TestRealDataDistroLimited(t *testing.T) {
 		{"linux, distribution unknown", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:9.6p1", "cpe:/o:linux:linux_kernel"}}, true, true},
 		{"nothing known", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:9.6p1"}}, true, true},
 		{"alpine, fixed", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:10.6p2", "cpe:/o:alpinelinux:alpine_linux"}}, false, false},
+		// Other spellings of known distributions' OS CPEs.
+		{"suse_linux", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:9.6p1", "cpe:/o:suse:suse_linux"}}, false, false},
+		{"fedora_core", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:9.6p1", "cpe:/o:fedoraproject:fedora_core"}}, false, false},
+		{"oracle linux", Observation{CPEs: []string{"cpe:/a:openbsd:openssh:9.6p1", "cpe:/o:oracle:linux"}}, false, false},
 	}
 	for _, c := range cases {
 		cand, got := find(c.obs)
@@ -353,6 +380,64 @@ func TestRealDataDistroLimited(t *testing.T) {
 		}
 		if c.conditional && (len(cand.Platforms.Names()) != 1 || cand.Platforms.Names()[0] != "alpine") {
 			t.Errorf("%s: only on %v, want [alpine]", c.name, cand.Platforms.Names())
+		}
+	}
+}
+
+// TestRealDataDistroRecordKinds covers a record naming a distribution under
+// another vendor's CPE (CVE-2015-1565: novell:opensuse) and a CVE with both a
+// distribution-limited and a plain configuration (CVE-2007-5795).
+func TestRealDataDistroRecordKinds(t *testing.T) {
+	src := loadRealData(t)
+	find := func(obs Observation, cve string) (Candidate, bool) {
+		for _, c := range CorrelateResult(obs, src).Confirmed() {
+			if c.CVE == cve {
+				return c, true
+			}
+		}
+		return Candidate{}, false
+	}
+	hitachi := func(os string) Observation {
+		return Observation{CPEs: []string{"cpe:/a:hitachi:device_manager:8.1.1", os}}
+	}
+	for os, want := range map[string]bool{
+		"cpe:/o:suse:linux_enterprise_server": true,
+		"cpe:/o:redhat:enterprise_linux":      true,
+		"cpe:/o:microsoft:windows":            true,
+		"cpe:/o:canonical:ubuntu_linux":       false,
+		"cpe:/o:apple:mac_os_x":               false,
+	} {
+		if _, got := find(hitachi(os), "CVE-2015-1565"); got != want {
+			t.Errorf("hitachi on %s: matched = %v, want %v", os, got, want)
+		}
+	}
+	for _, os := range []string{"cpe:/o:linux:linux_kernel", "cpe:/o:redhat:enterprise_linux", "cpe:/o:canonical:ubuntu_linux"} {
+		c, ok := find(Observation{CPEs: []string{"cpe:/a:gnu:emacs:22.1", os}}, "CVE-2007-5795")
+		if !ok || c.Platforms != 0 {
+			t.Errorf("emacs on %s: matched = %v, only on %v; want the unconditional record", os, ok, c.Platforms.Names())
+		}
+	}
+}
+
+func TestDistroFromOSCPE(t *testing.T) {
+	for in, want := range map[string]string{
+		"cpe:/o:canonical:ubuntu_linux":                 "ubuntu",
+		"cpe:/o:suse:suse_linux":                        "suse",
+		"cpe:/o:novell:opensuse":                        "suse",
+		"cpe:/o:fedoraproject:fedora_core":              "fedora",
+		"cpe:/o:redhat:enterprise_linux_server":         "rhel",
+		"cpe:/o:oracle:linux":                           "oracle",
+		"cpe:2.3:o:rocky:rocky_linux:9.0:*:*:*:*:*:*:*": "rocky",
+		"cpe:/o:amazon:linux_2":                         "amazon",
+		"cpe:/o:linux:linux_kernel":                     "",
+		"cpe:/o:microsoft:windows":                      "",
+	} {
+		c, _ := ParseCPEName(in)
+		if got := distroFromOSCPE(c); got != want {
+			t.Errorf("%s: distro %q, want %q", in, got, want)
+		}
+		if got := distroFromOSCPE(c); got != "" && distroLineage(got) == 0 {
+			t.Errorf("%s: distro %q has no lineage", in, got)
 		}
 	}
 }

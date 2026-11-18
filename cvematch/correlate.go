@@ -307,7 +307,16 @@ func matchEntry(e Entry, version string) (Candidate, bool) {
 		}
 		cand.VersionConfirmed = true
 	case e.hasRange():
-		if version == "" || !versionInRange(version, e, portable) {
+		inRange := version != ""
+		if inRange && e.Edition != "" {
+			b := e
+			b.StartIncluding, b.StartExcluding = editionBase(e.Product.Product, e.StartIncluding), editionBase(e.Product.Product, e.StartExcluding)
+			b.EndIncluding, b.EndExcluding = editionBase(e.Product.Product, e.EndIncluding), editionBase(e.Product.Product, e.EndExcluding)
+			inRange = versionInRange(editionBase(e.Product.Product, version), b, portable)
+		} else if inRange {
+			inRange = versionInRange(version, e, portable)
+		}
+		if !inRange {
 			return Candidate{}, false
 		}
 		cand.MatchBasis = version + " in " + rangeString(e)
@@ -360,6 +369,11 @@ func rangeString(e Entry) string {
 func better(a, b Candidate) bool {
 	if a.VersionConfirmed != b.VersionConfirmed {
 		return a.VersionConfirmed
+	}
+	// An unconditional record of the CVE beats one limited to a platform the
+	// observation did not show (CVE-2007-5795 has both for Emacs <= 22.1).
+	if (a.Platforms == 0) != (b.Platforms == 0) {
+		return a.Platforms == 0
 	}
 	if a.Score != b.Score {
 		return a.Score > b.Score

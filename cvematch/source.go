@@ -258,6 +258,10 @@ func (t *tables) holds(r rec, product, version string, vt []token, portable bool
 		return compareTokens(vt, versionTokens(lo)) == 0 ||
 			r.flags&fAnyUpdate != 0 && portableOnBound(version, lo, portable)
 	}
+	if r.flags&fEdition != 0 {
+		version, lo, hi = editionBase(product, version), editionBase(product, lo), editionBase(product, hi)
+		vt = versionTokens(version)
+	}
 	if r.flags&fStartIncl != 0 && compareTokens(vt, versionTokens(lo)) < 0 {
 		return false
 	}
@@ -375,6 +379,18 @@ type loader struct {
 	intern    map[string]string
 	versionID map[string]uint32
 	stats     LoadStats
+
+	// Per-CVE scratch for update-ANY pins, see add.
+	anyPins  []anyPin
+	portable map[string]bool
+}
+
+// anyPin locates an exact pin with update ANY that add indexed for the current CVE.
+type anyPin struct {
+	bucket map[string][]rec
+	vendor string // bucket key
+	i      int
+	cpe    CPE
 }
 
 func newLoader() *loader {
@@ -384,6 +400,7 @@ func newLoader() *loader {
 		byID:      map[string]uint32{},
 		intern:    map[string]string{},
 		versionID: map[string]uint32{"": 0},
+		portable:  map[string]bool{},
 	}
 }
 
@@ -658,6 +675,11 @@ func (l *loader) add(c nvdCVE) {
 					if cpe.UpdateAny {
 						r.flags |= fAnyUpdate
 					}
+					if fv := cpe.FullVersion(); strings.IndexByte(fv, 'p') > 0 {
+						if m := portableSuffixRe.FindStringSubmatch(fv); m != nil {
+							l.portable[cpe.Vendor+":"+cpe.Product+":"+m[1]] = true
+						}
+					}
 				}
 				if rule, ok := editionRules[cpe.Product]; ok && rule.vendor == cpe.Vendor && rule.edition == cpe.SWEdition {
 					r.flags |= fEdition
@@ -669,10 +691,26 @@ func (l *loader) add(c nvdCVE) {
 					vendors = map[string][]rec{}
 					l.byProduct[product] = vendors
 				}
+				if r.flags&fAnyUpdate != 0 {
+					l.anyPins = append(l.anyPins, anyPin{bucket: vendors, vendor: vendor, i: len(vendors[vendor]), cpe: cpe})
+				}
 				vendors[vendor] = append(vendors[vendor], r)
 			}
 		}
 	}
+	// Where the CVE also pins a portable build of a release ("7.1:p1",
+	// "3.7.1p1"), its pin of that release with update ANY means the bare release:
+	// CVE-2016-0777 pins 7.1:* and 7.1:p1 and is fixed in 7.1p2.
+	if len(l.portable) > 0 {
+		for _, a := range l.anyPins {
+			if l.portable[a.cpe.Vendor+":"+a.cpe.Product+":"+a.cpe.Version] {
+				a.bucket[a.vendor][a.i].flags &^= fAnyUpdate
+			}
+		}
+		clear(l.portable)
+	}
+	clear(l.anyPins)
+	l.anyPins = l.anyPins[:0]
 }
 
 // configPlatform returns the platforms an AND configuration limits its vulnerable
@@ -764,7 +802,9 @@ func portableOnBound(version, bound string, portable bool) bool {
 // whose version string shows that edition.
 type editionRule struct {
 	vendor, edition string
-	marker          *regexp.Regexp // matches the observed version of that edition
+	// marker matches a version of that edition; its first group is the edition
+	// suffix, which ranges compare without (see editionBase).
+	marker *regexp.Regexp
 }
 
 // editionRules lists the editions a version string tells apart, keyed by product.
@@ -775,7 +815,7 @@ type editionRule struct {
 // records (CVE-2026-10723 "9.11.3 to 9.18.50, supported_preview") do not apply to
 // the open-source 9.11.4.
 var editionRules = map[string]editionRule{
-	"bind": {vendor: "isc", edition: "supported_preview", marker: regexp.MustCompile(`[0-9]-?s[0-9]+([-._]|$)`)},
+	"bind": {vendor: "isc", edition: "supported_preview", marker: regexp.MustCompile(`[0-9](-?s[0-9]+)(?:[-._]|$)`)},
 }
 
 // editionShown reports whether the observed version of product shows the edition
@@ -783,6 +823,22 @@ var editionRules = map[string]editionRule{
 func editionShown(product, version string) bool {
 	rule, ok := editionRules[product]
 	return ok && rule.marker.MatchString(strings.ToLower(version))
+}
+
+// editionBase returns version without its edition suffix ("9.16.41-s1" ->
+// "9.16.41"). Edition records bound their ranges by release, sometimes with the
+// suffix ("9.16.8-S1 through 9.16.41-S1", CVE-2023-2829): under token order the
+// edition build of the last release would sort past a bare bound.
+func editionBase(product, version string) string {
+	rule, ok := editionRules[product]
+	if !ok {
+		return version
+	}
+	v := strings.ToLower(version)
+	if m := rule.marker.FindStringSubmatchIndex(v); m != nil {
+		return v[:m[2]] + v[m[3]:]
+	}
+	return v
 }
 
 // finish drops superseded/rejected records, trims every bucket to its size and

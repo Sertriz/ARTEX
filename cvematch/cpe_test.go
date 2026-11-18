@@ -207,6 +207,23 @@ func TestPlatforms(t *testing.T) {
 	if got := platformOf(cpe("cpe:2.3:o:linux:linux_kernel:-:*:*:*:*:*:*:*")); got != PlatformLinux {
 		t.Errorf("linux kernel = %v", got)
 	}
+	for _, s := range []string{"cpe:2.3:o:redhat:fedora_core:4:*:*:*:*:*:*:*", "cpe:2.3:o:redhat:desktop_workstation:5:*:*:*:*:*:*:*",
+		"cpe:2.3:o:redhat:enterprise_mrg:2.0:*:*:*:*:*:*:*", "cpe:2.3:o:redhat:fedora:9:*:*:*:*:*:*:*"} {
+		if got := platformOf(cpe(s)); got != PlatformLinux|PlatformRedHat {
+			t.Errorf("%s = %v", s, got.Names())
+		}
+	}
+	for s, want := range map[string]PlatformSet{
+		"cpe:2.3:a:redhat:jboss_web_server:3.0:*:*:*:*:*:*:*": PlatformOther, // an application, not an OS
+		"cpe:2.3:o:opensuse_project:leap:15.0:*:*:*:*:*:*:*":  PlatformLinux | PlatformSUSE,
+		"cpe:2.3:o:novell:opensuse:13.2:*:*:*:*:*:*:*":        PlatformLinux | PlatformSUSE,
+		"cpe:2.3:o:raspberrypi:raspbian:-:*:*:*:*:*:*:*":      PlatformLinux | PlatformDebian,
+		"cpe:2.3:o:novell:netware:6.5:*:*:*:*:*:*:*":          PlatformOther,
+	} {
+		if got := platformOf(cpe(s)); got != want {
+			t.Errorf("%s = %v, want %v", s, got.Names(), want.Names())
+		}
+	}
 	if got := platformOf(cpe("cpe:2.3:h:cisco:asa_5505:-:*:*:*:*:*:*:*")); got != PlatformOther {
 		t.Errorf("cisco = %v", got)
 	}
@@ -263,6 +280,14 @@ func TestDistroPlatforms(t *testing.T) {
 		// A family-only record is unchanged by the distribution.
 		{PlatformLinux, PlatformLinux, "ubuntu", false, false},
 		{PlatformWindows, 0, "", false, true},
+		// A record that also names a platform outside the known families (an
+		// application such as JBoss Web Server, an unknown OS) is never
+		// contradicted: it is conditional where it mismatches the known ones.
+		{PlatformLinux | PlatformRedHat | PlatformOther, PlatformLinux, "ubuntu", false, true},
+		{PlatformLinux | PlatformRedHat | PlatformOther, PlatformLinux, "rocky", false, false},
+		{PlatformWindows | PlatformOther, PlatformLinux, "", false, true},
+		{PlatformWindows | PlatformOther, PlatformWindows, "", false, false},
+		{PlatformOther, PlatformLinux, "ubuntu", false, false},
 	}
 	for _, c := range cases {
 		if got := contradicts(c.rec, c.obs, c.distro); got != c.contradicts {
