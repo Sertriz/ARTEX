@@ -48,11 +48,8 @@ const (
 	// and is taken over, so a dead sync never blocks the feed for long.
 	lockHeartbeat = time.Minute
 	staleLock     = 5 * time.Minute
-	// shrinkRestarts bounds how often an incremental window is re-read from the
-	// start when its result set shrinks while paging.
-	shrinkRestarts = 3
-	userAgent      = "artex-cve-sync"
-	maxBodyBytes   = 512 << 20 // one API page; a full page is tens of MB
+	userAgent     = "artex-cve-sync"
+	maxBodyBytes  = 512 << 20 // one API page; a full page is tens of MB
 	// NVD guidance: sleep about six seconds between requests without an API key
 	// (5 requests / 30 s); with a key the limit is 50 requests / 30 s.
 	delayNoKey   = 6 * time.Second
@@ -339,29 +336,18 @@ type apiPage struct {
 	} `json:"vulnerabilities"`
 }
 
-// errShrank reports a result set that shrank while it was paged: a record moved
-// out of the query (modified again, past the window's end), shifting every later
-// record one index down, so the next page would skip one.
-var errShrank = errors.New("NVD result set shrank while paging")
-
-// fetchAll pages through one query, handing every trimmed record to emit. An
-// incremental window whose result set shrinks is read again from the start (its
-// records are keyed by id, so the repeats are harmless); if it keeps shrinking, or
-// a full sync's does, the sync fails before its state moves, and the next one
-// fetches the same records again.
+// fetchAll pages through one query, handing every trimmed record to emit.
+//
+// The result set can shrink while it is paged: a record modified again during an
+// incremental sync leaves its lastMod window, shifting every later record one
+// index down, so the next page would skip one. When a page reports d fewer
+// results than the previous one, the cursor is moved back by d before going on:
+// at most d records shifted below it, so none is skipped. The records re-read are
+// handed to emit again, which is harmless (the incremental path keys records by
+// id, and the loader keeps one copy of a CVE). The pass always finishes, however
+// busy NVD is.
 func (o Options) fetchAll(ctx context.Context, q url.Values, stats *Stats, emit func(slimRecord, []byte) error) error {
-	for restarts := 0; ; restarts++ {
-		err := o.fetchPass(ctx, q, stats, emit)
-		if errors.Is(err, errShrank) && q != nil && restarts < shrinkRestarts {
-			o.Logf("[cve-sync] %v: reading the window again", err)
-			continue
-		}
-		return err
-	}
-}
-
-func (o Options) fetchPass(ctx context.Context, q url.Values, stats *Stats, emit func(slimRecord, []byte) error) error {
-	first := -1
+	ref := -1
 	for start, total := 0, -1; total < 0 || start < total; {
 		p := url.Values{}
 		for k, v := range q {
@@ -380,11 +366,6 @@ func (o Options) fetchPass(ctx context.Context, q url.Values, stats *Stats, emit
 			return err
 		}
 		total = page.TotalResults
-		if first < 0 {
-			first = total
-		} else if total < first {
-			return fmt.Errorf("%w (%d -> %d at index %d)", errShrank, first, total, start)
-		}
 		for _, v := range page.Vulnerabilities {
 			rec, line, err := slim(v.CVE)
 			if err != nil {
@@ -395,6 +376,14 @@ func (o Options) fetchPass(ctx context.Context, q url.Values, stats *Stats, emit
 				return err
 			}
 		}
+		if ref >= 0 && total < ref {
+			d := ref - total
+			o.Logf("[cve-sync] result set shrank by %d at index %d: reading the last %d again", d, start, d)
+			ref = total
+			start = max(0, start-d)
+			continue
+		}
+		ref = total
 		if len(page.Vulnerabilities) == 0 {
 			if start < total {
 				return fmt.Errorf("NVD returned an empty page at index %d of %d", start, total)

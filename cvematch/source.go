@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -598,9 +599,12 @@ func (l *loader) add(c nvdCVE) {
 				switch {
 				case m.VersionStartIncluding != "" || m.VersionStartExcluding != "" ||
 					m.VersionEndIncluding != "" || m.VersionEndExcluding != "":
-					// A ranged criteria can still name an update: OpenSSH's
-					// "openssh:*:p2 <= 7.2" (CVE-2016-6210) means up to 7.2p2. The
-					// update belongs to the upper bound (or the lower one alone).
+					// A ranged criteria can still name an update. Only a patch level
+					// of the bound release extends an inclusive upper bound: OpenSSH's
+					// "openssh:*:p2 <= 7.2" (CVE-2016-6210) means up to 7.2p2. A
+					// pre-release, preview, revision or numeric update ("rc2", "s1",
+					// "r18423", "5610") would widen the range past the fix release
+					// under token order, so those keep the bare bound.
 					start, end := m.VersionStartIncluding, m.VersionEndIncluding
 					if start == "" {
 						start = m.VersionStartExcluding
@@ -608,12 +612,8 @@ func (l *loader) add(c nvdCVE) {
 					if end == "" {
 						end = m.VersionEndExcluding
 					}
-					if cpe.Update != "" {
-						if end != "" {
-							end += cpe.Update
-						} else {
-							start += cpe.Update
-						}
+					if m.VersionEndIncluding != "" && patchUpdateRe.MatchString(cpe.Update) {
+						end += cpe.Update
 					}
 					if m.VersionStartIncluding != "" {
 						r.flags |= fStartIncl
@@ -683,10 +683,20 @@ type erratum struct {
 	endIncluding string // an inclusive upper bound that should be exclusive
 }
 
-// errata lists known NVD mistakes that would otherwise flag a fixed release:
-//   - CVE-2024-6387 (regreSSHion) is filed as openssh "<= 9.8", but 9.8/9.8p1 is
-//     the fix release (OpenSSH 9.8 release notes); the bound is exclusive.
-var errata = []erratum{{cve: "CVE-2024-6387", product: "openssh", endIncluding: "9.8"}}
+// errata lists known NVD mistakes that would otherwise flag a fixed release.
+// Both are OpenSSH "before X" bugs filed as "<= X"; the portable rule would then
+// include the fix release Xp1:
+//   - CVE-2024-6387 (regreSSHion), filed "<= 9.8": 9.8/9.8p1 is the fix release.
+//   - CVE-2006-5051 (the signal handler race regreSSHion reintroduced), "OpenSSH
+//     before 4.4", filed "<= 4.4": 4.4/4.4p1 is the fix release.
+var errata = []erratum{
+	{cve: "CVE-2024-6387", product: "openssh", endIncluding: "9.8"},
+	{cve: "CVE-2006-5051", product: "openssh", endIncluding: "4.4"},
+}
+
+// patchUpdateRe matches a CPE update that is a patch level of its release: a
+// portable/patch "p<n>" (OpenSSH, BIND's "-P2") or a single letter (ProFTPD 1.3.5a).
+var patchUpdateRe = regexp.MustCompile(`^(p[0-9]{1,3}|[a-z])$`)
 
 func applyErrata(id string, cpe CPE, r *rec, versions []string) {
 	for _, e := range errata {

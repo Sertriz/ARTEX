@@ -228,7 +228,7 @@ func nmapWebScheme(name, tunnel string) string {
 // caller; assetIdx is the index of the service's asset in s.Assets. The raw
 // product, version and extra strings only feed the correlator and the inert fact
 // detail, never a summary.
-func (s *scanIngest) addServiceObs(target string, assetIdx int, product, version, extra string, cpes []string) {
+func (s *scanIngest) addServiceObs(target, host string, assetIdx int, product, version, extra string, cpes []string) {
 	if strings.TrimSpace(product) == "" && len(cpes) == 0 {
 		return
 	}
@@ -238,6 +238,7 @@ func (s *scanIngest) addServiceObs(target string, assetIdx int, product, version
 	}
 	s.Services = append(s.Services, cveServiceObs{
 		Target:   target,
+		Host:     host,
 		AssetIdx: assetIdx,
 		Obs:      cvematch.Observation{CPEs: cpes, Product: product, Version: version, Extra: extra},
 	})
@@ -288,7 +289,7 @@ func (s *scanIngest) addNmapHost(h nmapHost) {
 			"version": p.Svc.Version, "tunnel": p.Svc.Tunnel, "cpe": p.Svc.CPE})
 		s.note("ports", ip+" "+pp+" "+name)
 		// The service asset is appended next, at index len(s.Assets).
-		s.addServiceObs(net.JoinHostPort(ip, strconv.Itoa(port))+"/"+p.Proto, len(s.Assets),
+		s.addServiceObs(net.JoinHostPort(ip, strconv.Itoa(port))+"/"+p.Proto, ip, len(s.Assets),
 			p.Svc.Product, p.Svc.Version, p.Svc.Extra+" "+p.Svc.OSType, p.Svc.CPE)
 		if scheme := nmapWebScheme(name, p.Svc.Tunnel); scheme != "" && p.Proto == "tcp" {
 			u := scheme + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
@@ -444,7 +445,11 @@ func (s *scanIngest) addHttpx(line []byte) {
 	if r.ContentLength > 0 {
 		item.ContentLength = &r.ContentLength
 	}
-	s.addHttpxServices(u, len(s.Assets), r.Tech, r.Webserver)
+	svcHost := item.IP // several names of one server share its IP
+	if svcHost == "" {
+		svcHost = host
+	}
+	s.addHttpxServices(u, svcHost, len(s.Assets), r.Tech, r.Webserver)
 	s.Assets = append(s.Assets, item)
 	s.note("urls", fmt.Sprintf("%s %d", u, r.StatusCode))
 	s.fact(fmt.Sprintf("httpx: %s responded with status %d", u, r.StatusCode),
@@ -463,7 +468,7 @@ var serverCommentRe = regexp.MustCompile(`\([^)]*\)`)
 // products of its Server header ("Apache/2.4.41 (Ubuntu) OpenSSL/1.1.1f").
 // Unversioned products are skipped: without a version nothing can be placed in a
 // range. The header and technology list also serve as the distribution hint.
-func (s *scanIngest) addHttpxServices(u string, assetIdx int, tech []string, webserver string) {
+func (s *scanIngest) addHttpxServices(u, host string, assetIdx int, tech []string, webserver string) {
 	target := httpTarget(u)
 	extra := webserver + " " + strings.Join(tech, " ")
 	seen := map[string]bool{}
@@ -474,7 +479,7 @@ func (s *scanIngest) addHttpxServices(u string, assetIdx int, tech []string, web
 			return
 		}
 		seen[key] = true
-		s.addServiceObs(target, assetIdx, name, version, extra, nil)
+		s.addServiceObs(target, host, assetIdx, name, version, extra, nil)
 	}
 	for _, t := range tech {
 		if i := strings.LastIndex(t, ":"); i > 0 {

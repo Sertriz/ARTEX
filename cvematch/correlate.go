@@ -2,6 +2,7 @@ package cvematch
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -76,6 +77,35 @@ func Correlate(obs Observation, src Source) []Candidate {
 	return CorrelateResult(obs, src).Candidates
 }
 
+// Key identifies what an observation correlates as: observations with the same
+// key yield the same Result, whatever else their banners say. It reads no record,
+// so it is cheap next to CorrelateResult and suits memoizing a scan's services.
+func Key(obs Observation, src Source) string {
+	targets, osCPEs := resolve(obs, src)
+	distro := observedDistro(obs, osCPEs)
+	var b strings.Builder
+	for _, t := range targets {
+		b.WriteString(t.p.String())
+		b.WriteByte('@')
+		b.WriteString(t.version)
+		b.WriteByte(',')
+	}
+	b.WriteString("|" + distro + "|")
+	b.WriteString(strconv.Itoa(int(observedPlatform(osCPEs, distro, obs.Extra, obs.Version))))
+	return b.String()
+}
+
+// observedDistro is the distribution an OS CPE names, else the one the banner
+// text names.
+func observedDistro(obs Observation, osCPEs []CPE) string {
+	for _, c := range osCPEs {
+		if d := distroFromOSCPE(c); d != "" {
+			return d
+		}
+	}
+	return DetectDistro(obs.Version, obs.Extra)
+}
+
 // target is one product to look up, with the version observed for it.
 type target struct {
 	p       Product
@@ -96,16 +126,7 @@ func CorrelateResult(obs Observation, src Source) Result {
 		return Result{}
 	}
 	targets, osCPEs := resolve(obs, src)
-	distro := ""
-	for _, c := range osCPEs {
-		if d := distroFromOSCPE(c); d != "" {
-			distro = d
-			break
-		}
-	}
-	if distro == "" {
-		distro = DetectDistro(obs.Version, obs.Extra)
-	}
+	distro := observedDistro(obs, osCPEs)
 	res := Result{Distro: distro, Platform: observedPlatform(osCPEs, distro, obs.Extra, obs.Version)}
 	for i, t := range targets {
 		res.Products = append(res.Products, t.p)

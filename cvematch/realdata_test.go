@@ -17,6 +17,9 @@ import (
 //     suffixes (CVE-2020-28017 Exim, CVE-2023-24329 Python, CVE-2021-27212
 //     OpenLDAP, CVE-2024-20961 MySQL, CVE-2021-32027 PostgreSQL, CVE-2023-46604
 //     ActiveMQ).
+//   - real-sample-3.jsonl: ranged criteria with non-patch updates (CVE-2023-50868
+//     BIND "*:s1", CVE-2008-7265 ProFTPD "*:rc2") and CVE-2006-5051, an OpenSSH
+//     "before 4.4" filed as "<= 4.4" (an erratum).
 //   - CVE-2024-6387.json.gz: the full, untrimmed regreSSHion record, gzipped.
 func loadRealData(t *testing.T) *NVDSource {
 	t.Helper()
@@ -24,8 +27,8 @@ func loadRealData(t *testing.T) *NVDSource {
 	if err != nil {
 		t.Fatalf("load testdata: %v", err)
 	}
-	if st := src.Stats(); st.Files != 3 || st.ErrorFiles != 0 || st.CVEs != 19 {
-		t.Fatalf("testdata stats %+v, want 3 files and 19 CVEs", st)
+	if st := src.Stats(); st.Files != 4 || st.ErrorFiles != 0 || st.CVEs != 22 {
+		t.Fatalf("testdata stats %+v, want 4 files and 22 CVEs", st)
 	}
 	return src
 }
@@ -189,5 +192,36 @@ func TestRealDataPlatformConditional(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("CVE-2024-4577 missing for an unknown OS")
+	}
+}
+
+// TestRealDataSpecificLeads checks single CVEs that a fix must include or exclude,
+// independent of the other records the version also matches.
+func TestRealDataSpecificLeads(t *testing.T) {
+	src := loadRealData(t)
+	cases := []struct {
+		name string
+		cpe  string
+		cve  string
+		want bool
+	}{
+		// "*:s1 [9.18.11, 9.18.24)" must not stretch past the 9.18.24 fix release.
+		{"bind 9.18.24 fixed", "cpe:/a:isc:bind:9.18.24", "CVE-2023-50868", false},
+		{"bind 9.18.23", "cpe:/a:isc:bind:9.18.23", "CVE-2023-50868", true},
+		// "*:rc2 <= 1.3.2" must not reach the 1.3.2a-e patch releases.
+		{"proftpd 1.3.2e", "cpe:/a:proftpd:proftpd:1.3.2e", "CVE-2008-7265", false},
+		{"proftpd 1.3.1", "cpe:/a:proftpd:proftpd:1.3.1", "CVE-2008-7265", true},
+		// CVE-2006-5051 is "before 4.4" filed as "<= 4.4": 4.4p1 is the fix.
+		{"openssh 4.4p1 fixed", "cpe:/a:openbsd:openssh:4.4p1", "CVE-2006-5051", false},
+		{"openssh 4.3p2", "cpe:/a:openbsd:openssh:4.3p2", "CVE-2006-5051", true},
+		// "*:p2 <= 7.2" still reaches 7.2p2.
+		{"openssh 7.2p2", "cpe:/a:openbsd:openssh:7.2p2", "CVE-2016-6210", true},
+		{"openssh 7.3p1", "cpe:/a:openbsd:openssh:7.3p1", "CVE-2016-6210", false},
+	}
+	for _, c := range cases {
+		res := CorrelateResult(Observation{CPEs: []string{c.cpe}}, src)
+		if got := contains(res.Confirmed(), c.cve); got != c.want {
+			t.Errorf("%s: %s confirmed=%v, want %v (%v)", c.name, c.cve, got, c.want, confirmedIDs(res))
+		}
 	}
 }

@@ -426,7 +426,9 @@ func TestIncrementalRereadsAShrinkingWindow(t *testing.T) {
 	}
 }
 
-func TestPersistentShrinkFailsWithoutMovingState(t *testing.T) {
+func TestPersistentShrinkStillCompletes(t *testing.T) {
+	// NVD keeps modifying the window: every pass sees the set shrink. The sync
+	// must still finish, with every record, and move its state.
 	dir := t.TempDir()
 	before := State{LastModEnd: time.Unix(1e9, 0).UTC()}
 	if err := writeState(dir, before); err != nil {
@@ -436,17 +438,19 @@ func TestPersistentShrinkFailsWithoutMovingState(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		recs = append(recs, rec(fmt.Sprintf("CVE-2024-000%d", i), "2025-01-01T00:00:00.000", "Modified", "1", "2"))
 	}
-	// Each pass: the first page sees 5, the rest 4.
 	nvd := &shrinkingTwice{inner: &shrinkingNVD{records: recs}}
 	srv := httptest.NewServer(nvd)
 	defer srv.Close()
 	var sleeps []time.Duration
 	o := options(t, srv, dir, &clock{t: time.Unix(1e9, 0).Add(time.Hour)}, &sleeps)
-	if _, err := Sync(context.Background(), o); !errors.Is(err, errShrank) {
-		t.Fatalf("err = %v, want errShrank", err)
+	if _, err := Sync(context.Background(), o); err != nil {
+		t.Fatalf("sync: %v", err)
 	}
-	if after, _ := ReadState(dir); !after.LastModEnd.Equal(before.LastModEnd) {
-		t.Error("a failed sync moved the state forward")
+	if lines := readLines(t, filepath.Join(dir, "nvd-2024.jsonl")); len(lines) != 5 {
+		t.Fatalf("got %d records, want 5", len(lines))
+	}
+	if after, _ := ReadState(dir); !after.LastModEnd.After(before.LastModEnd) {
+		t.Error("the state did not move")
 	}
 }
 
