@@ -208,6 +208,16 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/workspace/download?path=<rel> — stream a file as an attachment.
+//
+// The type is always application/octet-stream: agents write target-derived
+// files here, and with a type taken from the extension a .js file would load
+// as a same-origin <script> (a gadget past any script-src 'self' policy) and a
+// .html or .svg file would be markup of the console's origin wherever the
+// attachment disposition is not honoured. nosniff does not help when the
+// declared type is already script or markup. http.ServeFile keeps a
+// Content-Type set before it. The UI saves through fetch, a blob and
+// <a download> named from the path, so the saved name and bytes do not depend
+// on the type.
 func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 	abs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
@@ -222,6 +232,7 @@ func (s *Server) wsDownload(w http.ResponseWriter, r *http.Request) {
 	name := filepath.Base(abs)
 	// RFC 5987 filename* keeps non-ASCII names intact; plain filename is the fallback.
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(name)+"\"; filename*=UTF-8''"+url.PathEscape(name))
+	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeFile(w, r, abs)
 }
 

@@ -494,6 +494,8 @@ server {
     listen 443 ssl;
     server_name your.domain.com;
     # ssl_certificate / ssl_certificate_key ...
+    # HSTS belongs here, at the TLS proxy; ARTEX does not send it. Enable it once HTTPS works:
+    # add_header Strict-Transport-Security "max-age=31536000" always;
 
     location / {
         proxy_pass http://127.0.0.1:8787;
@@ -510,6 +512,20 @@ server {
     }
 }
 ```
+
+**Security headers**: ARTEX sets its own, so do not add them again at the proxy. Every response
+carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: same-origin`. `/api` responses add
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; sandbox` and
+`Cache-Control: no-store` (the SSE streams send `no-cache`); the UI adds `Permissions-Policy` and
+`Cross-Origin-Opener-Policy: same-origin`. COOP takes effect only over HTTPS or on localhost;
+reached over plain HTTP on a LAN address, the browser ignores it and logs a console error, which is
+harmless. Browsers enforce a second `Content-Security-Policy` from the proxy on top of ARTEX's, so
+a proxy policy can only restrict further and may break the UI. The one header to add at the proxy
+is `Strict-Transport-Security` (the commented `add_header` line above): ARTEX speaks plain HTTP and
+cannot tell whether the browser reached it over HTTPS. The headers come from the Go server only: UI
+pages served by `next dev` or from a `web/out` copied into another web server's root get none of
+them (add the UI set there yourself), while `/api`, which still reaches ARTEX, keeps the API set.
 
 **Login rate limit behind a proxy**: login allows 10 attempts per minute per client IP. Behind a
 proxy every request comes from the proxy's address, so without further setup all users share one
@@ -739,6 +755,12 @@ Operational security properties:
 - **Untrusted tool output**: framed as data for every agent by default (prompt-injection boundary).
 - **Release integrity**: SHA-256 sums, CycloneDX SBOM and GitHub build provenance attestations for
   release archives.
+- **Response headers**: `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: same-origin` on
+  every response, a sandboxing `Content-Security-Policy` and `Cache-Control: no-store` on `/api`,
+  `Permissions-Policy` and `Cross-Origin-Opener-Policy` on the UI (COOP applies only over HTTPS or
+  on localhost). Workspace downloads are always `application/octet-stream`, so an agent-written
+  `.js` or `.html` file cannot run with the console's origin. HSTS belongs at the TLS proxy (see
+  [Reverse proxy deployment](#reverse-proxy-deployment-https--exposing-only-443)).
 
 ---
 
