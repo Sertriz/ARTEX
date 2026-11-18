@@ -91,7 +91,7 @@ func TestCVEFeedReload(t *testing.T) {
 		t.Fatal("no source installed")
 	}
 	st := f.status()
-	if st["active"] != true || st["loaded"].(cvematch.LoadStats).CVEs != 22 {
+	if st["active"] != true || st["loaded"].(cvematch.LoadStats).CVEs != 37 {
 		t.Fatalf("status %v", st)
 	}
 
@@ -203,7 +203,7 @@ func TestCVEFeedHTTP(t *testing.T) {
 	if code, m := do("POST", "/api/settings/cve/reload", ""); code != 200 || m["active"] != true {
 		t.Fatalf("reload: %d %v", code, m)
 	}
-	if code, m := do("GET", "/api/settings/cve", ""); code != 200 || m["loaded"].(map[string]any)["cves"].(float64) != 22 {
+	if code, m := do("GET", "/api/settings/cve", ""); code != 200 || m["loaded"].(map[string]any)["cves"].(float64) != 37 {
 		t.Fatalf("status: %d %v", code, m)
 	}
 	if code, _ := do("POST", "/api/settings/cve/sync", `{"full":true}`); code != 202 {

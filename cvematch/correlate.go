@@ -44,9 +44,12 @@ type Candidate struct {
 	// BackportRisk is true for a version-confirmed match on a distribution build,
 	// whose package may carry the fix without a new upstream version.
 	BackportRisk bool
-	// Platforms is set when NVD limits the CVE to a platform the observation did
-	// not reveal (the lead holds only if the host runs one of them). A record whose
-	// platform the observation contradicts is not a candidate at all.
+	// Platforms is set when NVD limits the CVE to platforms the observation could
+	// not confirm (the lead holds only if the host runs one of them): the host's
+	// platform is unknown, its Linux distribution is unknown and the record names
+	// distributions, or the record also names a platform outside the known
+	// families ("other") that the scan cannot rule out. A record whose platforms
+	// the observation contradicts is not a candidate at all.
 	Platforms PlatformSet
 }
 
@@ -138,7 +141,7 @@ func CorrelateResult(obs Observation, src Source) Result {
 	best := map[string]Candidate{}
 	for _, t := range targets {
 		for _, e := range lookup(src, t.p, t.version) {
-			if contradicts(e.Platforms, res.Platform) {
+			if contradicts(e.Platforms, res.Platform, distro) {
 				continue
 			}
 			cand, ok := matchEntry(e, t.version)
@@ -146,7 +149,7 @@ func CorrelateResult(obs Observation, src Source) Result {
 				continue
 			}
 			cand.BackportRisk = cand.VersionConfirmed && distro != ""
-			if res.Platform == 0 {
+			if conditional(e.Platforms, res.Platform, distro) {
 				cand.Platforms = e.Platforms
 			}
 			if cur, exists := best[cand.CVE]; !exists || better(cand, cur) {
@@ -274,10 +277,11 @@ func vendorCount(src Source, product string) int {
 // matchEntry decides whether an Entry applies to the observed version.
 //
 // Plain token order follows NVD's conventions (OpenSSH 9.3p1 < 9.3p2, OpenSSL
-// 1.0.1f < 1.0.1g), with one OpenSSH rule: an inclusive upper bound naming a bare
-// release ("<= 7.9") includes that release's portable builds (7.9p1), see
-// portableOnBound. A pinned version must match exactly: NVD pins 9.3 (update "-")
-// and 9.3p1 separately.
+// 1.0.1f < 1.0.1g), with one OpenSSH rule: an inclusive upper bound or a pin with
+// update ANY that names a bare release ("<= 7.9", "8.2:*") includes that
+// release's portable builds (7.9p1, 8.2p1), see portableOnBound. Otherwise a
+// pinned version must match exactly: NVD pins 9.3 (update "-") and 9.3p1
+// separately. A record limited to an edition needs the version to show it.
 func matchEntry(e Entry, version string) (Candidate, bool) {
 	cand := Candidate{
 		CVE:         e.CVE,
@@ -288,15 +292,34 @@ func matchEntry(e Entry, version string) (Candidate, bool) {
 		Vector:      e.Vector,
 		Description: e.Description,
 	}
+	if e.Edition != "" && !editionShown(e.Product.Product, version) {
+		return Candidate{}, false
+	}
+	portable := e.Product.Product == "openssh"
 	switch {
 	case e.ExactVersion != "":
-		if version == "" || CompareVersions(version, e.ExactVersion) != 0 {
+		switch {
+		case version == "":
+			return Candidate{}, false
+		case CompareVersions(version, e.ExactVersion) == 0:
+			cand.MatchBasis = version + " == " + e.ExactVersion
+		case e.AnyUpdate && portableOnBound(version, e.ExactVersion, portable):
+			cand.MatchBasis = version + " is a portable build of " + e.ExactVersion
+		default:
 			return Candidate{}, false
 		}
-		cand.MatchBasis = version + " == " + e.ExactVersion
 		cand.VersionConfirmed = true
 	case e.hasRange():
-		if version == "" || !versionInRange(version, e, e.Product.Product == "openssh") {
+		inRange := version != ""
+		if inRange && e.Edition != "" {
+			b := e
+			b.StartIncluding, b.StartExcluding = editionBase(e.Product.Product, e.StartIncluding), editionBase(e.Product.Product, e.StartExcluding)
+			b.EndIncluding, b.EndExcluding = editionBase(e.Product.Product, e.EndIncluding), editionBase(e.Product.Product, e.EndExcluding)
+			inRange = versionInRange(editionBase(e.Product.Product, version), b, portable)
+		} else if inRange {
+			inRange = versionInRange(version, e, portable)
+		}
+		if !inRange {
 			return Candidate{}, false
 		}
 		cand.MatchBasis = version + " in " + rangeString(e)
@@ -349,6 +372,11 @@ func rangeString(e Entry) string {
 func better(a, b Candidate) bool {
 	if a.VersionConfirmed != b.VersionConfirmed {
 		return a.VersionConfirmed
+	}
+	// An unconditional record of the CVE beats one limited to a platform the
+	// observation did not show (CVE-2007-5795 has both for Emacs <= 22.1).
+	if (a.Platforms == 0) != (b.Platforms == 0) {
+		return a.Platforms == 0
 	}
 	if a.Score != b.Score {
 		return a.Score > b.Score

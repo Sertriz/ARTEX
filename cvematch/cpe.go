@@ -43,6 +43,14 @@ type CPE struct {
 	Product string
 	Version string
 	Update  string
+	// UpdateAny is true when the update field is the wildcard ANY ("*", or absent),
+	// which covers every update of the version; NA ("-") says there is none. Both
+	// leave Update empty, and NVD uses the difference: "openssh:8.2:*" covers the
+	// portable 8.2p1, "openssh:9.3:-" does not.
+	UpdateAny bool
+	// SWEdition is the CPE 2.3 software edition ("supported_preview" for ISC's
+	// BIND -S builds), "" for ANY or NA.
+	SWEdition string
 }
 
 // Prod returns the vendor:product identity.
@@ -79,8 +87,13 @@ func ParseCPEName(s string) (CPE, bool) {
 	if len(f) >= 4 {
 		c.Version = cpeField(f[3])
 	}
+	c.UpdateAny = true
 	if len(f) >= 5 {
 		c.Update = cpeField(f[4])
+		c.UpdateAny = f[4] == "*" || f[4] == ""
+	}
+	if strings.HasPrefix(s, "cpe:2.3:") && len(f) >= 8 {
+		c.SWEdition = cpeField(f[7])
 	}
 	if c.Vendor == "" && c.Product == "" {
 		return CPE{}, false
@@ -228,8 +241,9 @@ func productVersion(p Product, v string) string {
 }
 
 // PlatformSet is a set of operating-system families a CVE record is limited to
-// (NVD's "running on" AND configurations), or that an observation runs on.
-type PlatformSet uint8
+// (NVD's "running on" AND configurations), or that an observation runs on. A
+// record limited to particular Linux distributions also carries their lineages.
+type PlatformSet uint16
 
 // Platform families.
 const (
@@ -240,30 +254,54 @@ const (
 	PlatformOther // a platform outside the families above: never contradicted
 )
 
+// Linux distribution lineages. A record carries them only when every Linux
+// platform it names is a known distribution (Alpine-only CVE-2026-123158); one
+// naming the kernel or an unknown distribution applies to any Linux. A lineage
+// groups the distributions that rebuild one another's packages, so a record is
+// only ruled out by a distribution from another lineage: a Debian-limited record
+// is kept on Ubuntu, a RHEL-limited one on Rocky Linux.
+const (
+	PlatformDebian PlatformSet = 1 << (iota + 8) // Debian, Ubuntu, Raspbian
+	PlatformRedHat                               // RHEL, CentOS, Rocky, AlmaLinux, Fedora, Oracle and Amazon Linux
+	PlatformSUSE                                 // SUSE Linux Enterprise, openSUSE
+	PlatformAlpine                               // Alpine Linux (musl)
+)
+
 // platformUnix is what a generic "Unix" says: some non-Windows system.
 const platformUnix = PlatformLinux | PlatformApple | PlatformBSD
 
-// Names lists the families in the set.
+// platformDistros masks the distribution lineages.
+const platformDistros = PlatformDebian | PlatformRedHat | PlatformSUSE | PlatformAlpine
+
+var platformNames = []struct {
+	bit  PlatformSet
+	name string
+}{
+	{PlatformWindows, "windows"}, {PlatformLinux, "linux"}, {PlatformApple, "apple"}, {PlatformBSD, "bsd"}, {PlatformOther, "other"},
+	{PlatformDebian, "debian"}, {PlatformRedHat, "redhat"}, {PlatformSUSE, "suse"}, {PlatformAlpine, "alpine"},
+}
+
+// Names lists the families in the set. Distribution lineages stand in for
+// "linux" when the set has them: a record limited to Alpine is "alpine".
 func (s PlatformSet) Names() []string {
 	var out []string
-	for _, f := range []struct {
-		bit  PlatformSet
-		name string
-	}{{PlatformWindows, "windows"}, {PlatformLinux, "linux"}, {PlatformApple, "apple"}, {PlatformBSD, "bsd"}, {PlatformOther, "other"}} {
-		if s&f.bit != 0 {
+	for _, f := range platformNames {
+		if s&f.bit != 0 && (f.bit != PlatformLinux || s&platformDistros == 0) {
 			out = append(out, f.name)
 		}
 	}
 	return out
 }
 
-// platformOf maps a platform CPE to its family.
+// platformOf maps a platform CPE to its family, plus its lineage for a known
+// Linux distribution.
 func platformOf(c CPE) PlatformSet {
 	switch {
 	case c.Vendor == "microsoft" && strings.HasPrefix(c.Product, "windows"):
 		return PlatformWindows
-	case strings.Contains(c.Product, "linux") || c.Product == "fedora" || c.Vendor == "suse" || c.Vendor == "opensuse":
-		return PlatformLinux
+	case strings.Contains(c.Product, "linux") || c.Product == "fedora" || c.Product == "centos" || c.Product == "almalinux" ||
+		c.Vendor == "suse" || c.Vendor == "opensuse" || distroLineageOfCPE(c) != 0:
+		return PlatformLinux | distroLineageOfCPE(c)
 	case c.Vendor == "apple" && (c.Product == "mac_os_x" || c.Product == "macos" || c.Product == "iphone_os" || c.Product == "ipados"):
 		return PlatformApple
 	case c.Product == "freebsd" || c.Product == "openbsd" || c.Product == "netbsd":
@@ -272,18 +310,62 @@ func platformOf(c CPE) PlatformSet {
 	return PlatformOther
 }
 
+// distroLineageOfCPE returns the lineage of a Linux distribution's OS CPE, 0 for
+// the kernel or a distribution outside the lineages.
+func distroLineageOfCPE(c CPE) PlatformSet {
+	switch {
+	case c.Vendor == "debian" && (c.Product == "debian_linux" || c.Product == "linux"),
+		(c.Vendor == "canonical" || c.Vendor == "ubuntu") && (c.Product == "ubuntu_linux" || c.Product == "linux"),
+		c.Product == "raspbian":
+		return PlatformDebian
+	case c.Vendor == "redhat" && (c.Part == "o" || strings.HasPrefix(c.Product, "enterprise_linux") || c.Product == "linux"),
+		c.Vendor == "centos" && c.Product == "centos", c.Vendor == "fedoraproject" && strings.HasPrefix(c.Product, "fedora"),
+		c.Product == "rocky_linux", c.Product == "almalinux", c.Vendor == "oracle" && c.Product == "linux",
+		c.Vendor == "amazon" && (c.Product == "linux" || c.Product == "amazon_linux" || strings.HasPrefix(c.Product, "linux_")):
+		return PlatformRedHat
+	case c.Vendor == "suse" || c.Vendor == "opensuse" || c.Vendor == "opensuse_project" ||
+		c.Vendor == "novell" && (strings.Contains(c.Product, "suse") || strings.Contains(c.Product, "linux")):
+		return PlatformSUSE
+	case c.Vendor == "alpinelinux" && c.Product == "alpine_linux":
+		return PlatformAlpine
+	}
+	return 0
+}
+
+// distroLineage returns the lineage of a distribution name DetectDistro reports.
+func distroLineage(distro string) PlatformSet {
+	switch distro {
+	case "debian", "ubuntu", "raspbian":
+		return PlatformDebian
+	case "rhel", "centos", "rocky", "almalinux", "fedora", "amazon", "oracle":
+		return PlatformRedHat
+	case "suse":
+		return PlatformSUSE
+	case "alpine":
+		return PlatformAlpine
+	}
+	return 0
+}
+
 var (
 	windowsTextRe = regexp.MustCompile(`windows|win32|win64|microsoft-iis|\biis\b`)
 	unixTextRe    = regexp.MustCompile(`\bunix\b|linux`)
 )
 
 // observedPlatform derives the OS family a service runs on from its OS CPEs, the
-// detected distribution and its banner text; 0 when nothing says.
+// detected distribution and its banner text; 0 when nothing says. It never holds
+// a distribution lineage: the distribution itself is matched by contradicts.
 func observedPlatform(osCPEs []CPE, distro string, texts ...string) PlatformSet {
 	for _, c := range osCPEs {
-		if f := platformOf(c); f != PlatformOther {
+		if f := platformOf(c) &^ platformDistros; f != PlatformOther {
 			return f
 		}
+	}
+	// A distribution here was read from banner text, as was any Windows evidence
+	// (Win64, Microsoft-IIS): the explicit Windows server wins.
+	all := strings.ToLower(strings.Join(texts, " "))
+	if windowsTextRe.MatchString(all) {
+		return PlatformWindows
 	}
 	switch distro {
 	case "":
@@ -292,20 +374,52 @@ func observedPlatform(osCPEs []CPE, distro string, texts ...string) PlatformSet 
 	default:
 		return PlatformLinux
 	}
-	all := strings.ToLower(strings.Join(texts, " "))
-	switch {
-	case windowsTextRe.MatchString(all):
-		return PlatformWindows
-	case unixTextRe.MatchString(all):
+	if unixTextRe.MatchString(all) {
 		return platformUnix
 	}
 	return 0
 }
 
 // contradicts reports whether a record limited to the platforms in rec cannot
-// apply to a service observed on obs.
-func contradicts(rec, obs PlatformSet) bool {
-	return rec != 0 && obs != 0 && rec&PlatformOther == 0 && rec&obs == 0
+// apply to a service observed on obs, built by distro (the DetectDistro name, ""
+// when unknown): its family is not one of the record's, or it is a Linux service
+// from a distribution lineage the record does not name. A record that also names
+// a platform outside the known families (an application such as JBoss Web
+// Server, an unknown OS) is never contradicted: conditional marks it instead.
+func contradicts(rec, obs PlatformSet, distro string) bool {
+	return rec&PlatformOther == 0 && mismatch(rec, obs, distro)
+}
+
+// conditional reports whether a record limited to rec applies to the observation
+// only under a condition it could not check: the platform is unknown, a Linux
+// service's distribution is unknown and the record names distributions, or the
+// observation mismatches every platform the record names but one outside the
+// known families.
+func conditional(rec, obs PlatformSet, distro string) bool {
+	switch {
+	case rec == 0:
+		return false
+	case obs == 0:
+		return true
+	case rec&platformDistros != 0 && obs&PlatformLinux != 0 && distroLineage(distro) == 0:
+		return true
+	}
+	return rec&PlatformOther != 0 && mismatch(rec, obs, distro)
+}
+
+// mismatch reports whether the observation is outside every known platform the
+// record names: another family, or a Linux distribution of another lineage.
+func mismatch(rec, obs PlatformSet, distro string) bool {
+	fam := rec &^ platformDistros &^ PlatformOther
+	if fam != 0 && obs != 0 && fam&obs == 0 {
+		return true
+	}
+	if d := rec & platformDistros; d != 0 && obs&PlatformLinux != 0 {
+		if l := distroLineage(distro); l != 0 && d&l == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // mariadbCompatPrefix is the "5.5.5-" MariaDB puts before its real version in the
@@ -322,13 +436,14 @@ var distroPatterns = []struct {
 	{"raspbian", regexp.MustCompile(`raspbian`)},
 	{"ubuntu", regexp.MustCompile(`ubuntu`)},
 	{"debian", regexp.MustCompile(`debian|\+deb[0-9]|deb[0-9]+u[0-9]+`)},
-	{"rocky", regexp.MustCompile(`rocky`)},
+	{"rocky", regexp.MustCompile(`\brocky\b`)},
 	{"almalinux", regexp.MustCompile(`almalinux`)},
-	{"centos", regexp.MustCompile(`centos`)},
-	{"rhel", regexp.MustCompile(`red ?hat|rhel|\.el[0-9]+`)},
+	{"centos", regexp.MustCompile(`\bcentos\b`)},
+	{"rhel", regexp.MustCompile(`red ?hat|\brhel|\.el[0-9]+`)},
 	{"fedora", regexp.MustCompile(`fedora|\.fc[0-9]+`)},
-	{"suse", regexp.MustCompile(`suse|sles`)},
-	{"alpine", regexp.MustCompile(`alpine`)},
+	{"suse", regexp.MustCompile(`suse\b|\bsles\b`)},
+	// Not the Alpine.js library an httpx technology list can name.
+	{"alpine", regexp.MustCompile(`\balpine($|[^.\w])`)},
 	{"amazon", regexp.MustCompile(`amzn|amazon linux`)},
 	{"freebsd", regexp.MustCompile(`freebsd`)},
 }
@@ -369,8 +484,36 @@ func distroFromOSCPE(c CPE) string {
 		return "alpine"
 	case "amazon:linux", "amazon:amazon_linux":
 		return "amazon"
+	case "oracle:linux":
+		return "oracle"
 	case "freebsd:freebsd":
 		return "freebsd"
+	}
+	// Other releases and spellings of the distributions above (suse:suse_linux,
+	// novell:opensuse, fedoraproject:fedora_core, redhat:enterprise_linux_server).
+	switch {
+	case c.Product == "rocky_linux":
+		return "rocky"
+	case c.Product == "almalinux":
+		return "almalinux"
+	case c.Product == "raspbian":
+		return "raspbian"
+	}
+	switch distroLineageOfCPE(c) {
+	case PlatformDebian:
+		return "debian"
+	case PlatformRedHat:
+		switch c.Vendor {
+		case "fedoraproject":
+			return "fedora"
+		case "amazon":
+			return "amazon"
+		}
+		return "rhel"
+	case PlatformSUSE:
+		return "suse"
+	case PlatformAlpine:
+		return "alpine"
 	}
 	return ""
 }
