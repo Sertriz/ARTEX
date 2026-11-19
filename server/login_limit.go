@@ -29,10 +29,13 @@ type loginEntry struct {
 	lastSeen     time.Time
 }
 
-// loginLimiter counts login attempts per IP. Past loginMaxAttempts in one
-// loginWindow the IP is blocked for loginBaseBlock; every attempt while blocked,
-// and every later block, doubles the block up to loginMaxBlock. State is in
-// memory only and swept of idle entries, so a restart clears it.
+// loginLimiter counts attempts per key: the client IP for login (s.loginLimit),
+// a hash of the session token for change-password (s.pwLimit). Past
+// loginMaxAttempts in one loginWindow the key is blocked for loginBaseBlock;
+// every attempt while blocked, and every later block, doubles the block up to
+// loginMaxBlock. State is in memory only and swept of idle entries, so a
+// restart clears it. A nil *loginLimiter allows everything, so Server literals
+// in tests need not set one.
 type loginLimiter struct {
 	mu        sync.Mutex
 	now       func() time.Time
@@ -47,6 +50,9 @@ func newLoginLimiter(now func() time.Time) *loginLimiter {
 // allow records one attempt from ip. It returns 0 when the attempt may go on,
 // otherwise how long ip must wait.
 func (l *loginLimiter) allow(ip string) time.Duration {
+	if l == nil {
+		return 0
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
@@ -85,6 +91,9 @@ func (l *loginLimiter) allow(ip string) time.Duration {
 // reset forgets ip, after a successful login. A blocked IP never reaches the
 // password check, so this only runs outside a block.
 func (l *loginLimiter) reset(ip string) {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.entries, ip)

@@ -27,7 +27,7 @@ func TestInterceptAlwaysAllowPG(t *testing.T) {
 	m := &Manager{pg: d, interceptor: intercept.New(d)}
 	s := &Server{m: m, jwtKey: []byte("always-allow-test-key")}
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}

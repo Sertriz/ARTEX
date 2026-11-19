@@ -36,7 +36,7 @@ INSERT INTO skill_usage(skill,agent_key,task_id,found) VALUES
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	defer stopTestServer(t, s, cancel)
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}
