@@ -505,13 +505,13 @@ worker then wrap-up; pick well above 70,000 for real exploration.
 
 **CVE correlation (off by default)**: set `ARTEX_CVE_FEED_DIR` to a directory for a local copy of
 the NVD CVE data (in Docker, under `/app/data`), then fill it with `artex -cve-sync` or the **CVE
-correlation feed** card in System settings (the first sync downloads every CVE: about 20 minutes, or
-a few minutes with `ARTEX_NVD_API_KEY`; later syncs fetch only changes). `ARTEX_CVE_SYNC_INTERVAL`
+correlation feed** card in System settings (the first sync downloads every CVE: 25 to 40 minutes,
+or about 10 with `ARTEX_NVD_API_KEY`; later syncs fetch only changes). `ARTEX_CVE_SYNC_INTERVAL`
 (for example `24h`) keeps it fresh automatically; `artex -cve-check` reports what the directory
 holds. Air-gapped installs can drop NVD 2.0 JSON files (`.json`, `.jsonl`, optionally `.gz`) into
 the directory and reload. Once loaded, `ingest_scan_output` correlates nmap and httpx services and
-writes one unverified "CVE lead" fact per distinct software version. The whole NVD takes roughly
-350 MB of memory once loaded (up to ~900 MB while loading). Unset, nothing changes. Details:
+writes one unverified "CVE lead" fact per distinct software version. The whole NVD takes about
+235 MB of memory once loaded (about 700 MB at peak while loading). Unset, nothing changes. Details:
 [docs/cve-correlation-design.md](docs/cve-correlation-design.md).
 
 **Common flags**: `./start.sh -addr :8787 -proxy :8788` (`-addr` frontend/API, `-proxy` traffic
