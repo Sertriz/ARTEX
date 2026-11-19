@@ -751,7 +751,11 @@ Operational security properties:
 - **First-run claim**: `/setup` requires a one-time token printed at startup; the UI binds to
   `127.0.0.1` by default.
 - **Login protection**: 10 attempts per minute per client IP, with `ARTEX_TRUSTED_PROXIES` for
-  correct client attribution behind a reverse proxy.
+  correct client attribution behind a reverse proxy. Password changes have a limit of their own,
+  10 attempts per minute per session token, and a wrong current password answers 403.
+- **Session tokens**: HS256 only, with a required expiry (7 days) and subject. Only
+  `/api/auth/status`, `/api/auth/init`, `/api/auth/login` and `/api/health` answer without a
+  token, and only the three event streams can be read from another origin (CORS).
 - **Untrusted tool output**: framed as data for every agent by default (prompt-injection boundary).
 - **Release integrity**: SHA-256 sums, CycloneDX SBOM and GitHub build provenance attestations for
   release archives.
