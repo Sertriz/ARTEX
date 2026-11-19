@@ -6,8 +6,6 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
-	"path"
-	"strings"
 )
 
 // webuiDist holds the statically-exported frontend (built with
@@ -18,43 +16,11 @@ import (
 //go:embed all:webui/dist
 var webuiDist embed.FS
 
-// webuiHandler serves the embedded SPA. Public (no JWT) — auth is enforced
-// client-side and on /api. Serves the exported per-route index.html files and
-// falls back to index.html so client-side routing still resolves unknown paths.
+// webuiHandler serves the embedded SPA through newWebUIHandler (webui.go).
 func (s *Server) webuiHandler() http.Handler {
 	root, err := fs.Sub(webuiDist, "webui/dist")
 	if err != nil {
 		panic(err)
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
-		if p == "" {
-			p = "index.html"
-		}
-		// 1) exact file (assets: _next/*, favicon.ico, ...)
-		// 2) route dir → <p>/index.html (trailingSlash export)
-		// 3) <p>.html
-		// 4) SPA fallback → index.html (hand it to client-side routing)
-		for _, cand := range []string{p, p + "/index.html", p + ".html"} {
-			if serveFileIfExists(w, r, root, cand) {
-				return
-			}
-		}
-		http.ServeFileFS(w, r, root, "index.html")
-	})
-}
-
-// serveFileIfExists serves name from fsys when it exists as a regular file.
-func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
-	f, err := fsys.Open(name)
-	if err != nil {
-		return false
-	}
-	st, statErr := f.Stat()
-	_ = f.Close()
-	if statErr != nil || st.IsDir() {
-		return false
-	}
-	http.ServeFileFS(w, r, fsys, name)
-	return true
+	return newWebUIHandler(root)
 }
