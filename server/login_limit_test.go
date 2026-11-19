@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -278,19 +279,31 @@ func TestHealthHidesVersionWithoutToken(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	s := &Server{jwtKey: key}
 
-	w := httptest.NewRecorder()
-	s.health(w, httptest.NewRequest("GET", "/api/health", nil))
-	if got := strings.TrimSpace(w.Body.String()); w.Code != 200 || got != `{"ok":true}` {
-		t.Fatalf("no token: status=%d body=%s want {\"ok\":true}", w.Code, got)
+	// No token, and tokens authenticate rejects, get the bare answer.
+	for name, tok := range map[string]string{
+		"no token": "",
+		"HS384":    mintToken(t, jwt.SigningMethodHS384, key, jwt.RegisteredClaims{Subject: "ARTEX", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))}),
+		"expired":  mintToken(t, jwt.SigningMethodHS256, key, jwt.RegisteredClaims{Subject: "ARTEX", ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Minute))}),
+		"no exp":   mintToken(t, jwt.SigningMethodHS256, key, jwt.RegisteredClaims{Subject: "ARTEX"}),
+	} {
+		r := httptest.NewRequest("GET", "/api/health", nil)
+		if tok != "" {
+			r.Header.Set("Authorization", "Bearer "+tok)
+		}
+		w := httptest.NewRecorder()
+		s.health(w, r)
+		if got := strings.TrimSpace(w.Body.String()); w.Code != 200 || got != `{"ok":true}` {
+			t.Fatalf("%s: status=%d body=%s want {\"ok\":true}", name, w.Code, got)
+		}
 	}
 
-	tok, err := signJWT(key)
+	tok, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("GET", "/api/health", nil)
 	r.Header.Set("Authorization", "Bearer "+tok)
-	w = httptest.NewRecorder()
+	w := httptest.NewRecorder()
 	s.health(w, r)
 	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["version"] != BuildVersion || body["service"] != "artex" {

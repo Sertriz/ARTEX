@@ -55,7 +55,7 @@ func rewriteServer(t *testing.T) (*Server, func(auth bool, method, path, body st
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	s.archiveWG.Wait()
 	<-s.side.done
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -63,7 +63,7 @@ INSERT INTO skill_usage(skill,task_id,found) VALUES ('api-recon',$1,true),('grap
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	defer stopTestServer(t, s, cancel)
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}

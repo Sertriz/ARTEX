@@ -41,7 +41,7 @@ func newGateServer(t *testing.T) *gateServer {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,23 +562,6 @@ func TestInterceptDecideRecordsApproverOverHTTP(t *testing.T) {
 	}
 	if code, _ := g.do(t, "GET", "/api/intercept/history?decision_source=nonsense&page=1", ""); code != 400 {
 		t.Fatalf("unknown decision_source: %d, want 400", code)
-	}
-}
-
-func TestJWTSubject(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	token, err := signJWT(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := jwtSubject(token, key); got != "ARTEX" {
-		t.Fatalf("subject = %q, want ARTEX", got)
-	}
-	if got := jwtSubject(token, []byte("another key, another key, another")); got != "" {
-		t.Fatalf("subject of a token signed with another key = %q, want none", got)
-	}
-	if got := jwtSubject("", key); got != "" {
-		t.Fatalf("subject of no token = %q", got)
 	}
 }
 

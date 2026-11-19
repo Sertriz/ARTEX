@@ -27,7 +27,7 @@ func TestMgmtAPI(t *testing.T) {
 	s := New(ctx, m, td, td, td)
 	defer stopTestServer(t, s, cancel)
 	h := s.Handler()
-	tok, err := signJWT(s.jwtKey)
+	tok, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatalf("sign jwt: %v", err)
 	}
