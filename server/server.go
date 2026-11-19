@@ -4214,14 +4214,25 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 		_, _ = t.Store.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", "human", nil)
 		return "Hint recorded; the planner will read it next time: " + text
 	default:
-		assetCounts, _ := s.m.Assets().CountsByType()
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		assetCounts, _ := s.m.Assets().CountsByTypeForTask(taskID)
 		assets := 0
 		for _, c := range assetCounts {
 			assets += c
 		}
 		fnd, _ := t.Store.ListByKind(db.KindFinding, 1000)
+		meta := map[int64]db.FindingMeta{}
+		if s.m.pg != nil {
+			meta, _ = s.m.pg.FindingMetaByNodeID(taskID)
+		}
+		findings := 0
+		for _, n := range fnd {
+			if !db.FindingDismissed(meta[n.ID].Status) {
+				findings++
+			}
+		}
 		fr, _ := t.Store.Frontier(1000)
-		return fmt.Sprintf("(rule mode, no LLM configured) Current situation: assets %d, open intents %d, confirmed findings %d.\nAvailable commands: \"intent ...\" injects an intent, \"hint ...\" leaves the planner a hint.", assets, len(fr), len(fnd))
+		return fmt.Sprintf("(rule mode, no LLM configured) Current situation: assets %d, open intents %d, findings %d.\nAvailable commands: \"intent ...\" injects an intent, \"hint ...\" leaves the planner a hint.", assets, len(fr), findings)
 	}
 }
 
@@ -4231,18 +4242,31 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "no active task")
 		return
 	}
-	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // pure vulnerabilities (facts are a separate KindFact and never enter the report)
-	counts := map[string]int{}
-	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
-		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)
-		if len(ns) > 0 {
-			counts[ty] = len(ns)
-		}
+	// A read that fails must fail the report: rendered as empty, it would tell the
+	// reader the task found nothing or touched no assets.
+	findings, err := t.Store.ListByKind(db.KindFinding, 1000) // pure vulnerabilities (facts are a separate KindFact and never enter the report)
+	if err != nil {
+		log.Printf("[report] task=%s findings: %v", t.ID, err)
+		writeErr(w, 500, "report unavailable: the findings lookup failed, retry")
+		return
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	// The asset graph is shared by every task: count only this task's assets, or the
+	// report discloses the size of other engagements.
+	counts, err := s.m.Assets().CountsByTypeForTask(taskID)
+	if err != nil {
+		log.Printf("[report] task=%s asset counts: %v", t.ID, err)
+		writeErr(w, 500, "report unavailable: the asset count failed, retry")
+		return
+	}
 	var ledger *db.CoverageLedger
 	if t.CoverageEnabled {
-		ledger, _ = s.m.Assets().CoverageLedger(taskID)
+		// nil means "coverage off" to the renderer, so a failed read must not become nil.
+		if ledger, err = s.m.Assets().CoverageLedger(taskID); err != nil {
+			log.Printf("[report] task=%s coverage ledger: %v", t.ID, err)
+			writeErr(w, 500, "report unavailable: the coverage ledger lookup failed, retry")
+			return
+		}
 	}
 	// The exploration node payload carries only name/summary/evidence/severity/
 	// vulnclass. Everything the report says about proof strength (poe level,

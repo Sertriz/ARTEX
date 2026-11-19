@@ -5,6 +5,7 @@ package report
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -70,15 +71,41 @@ func Markdown(in Input) string {
 	fmt.Fprintf(&b, "- **Task goal**: %s\n", nz(in.Goal, "(unspecified)"))
 	fmt.Fprintf(&b, "- **Generated at**: %s\n\n", in.GeneratedAt.Format("2006-01-02 15:04:05"))
 
+	// Triage decides what the report may list. Every finding node an agent recorded
+	// reaches this point; one the operator marked false positive, duplicate or ignored
+	// is not part of the deliverable, so it is counted (the reader learns it existed
+	// and why it is absent) but not listed.
+	fs := make([]findingView, 0, len(in.Findings))
+	var listed, dismissed tally
+	for _, n := range in.Findings {
+		v := parseFinding(n)
+		v.Q = qualityFromRows(n.ID, in.Quality)
+		if db.FindingDismissed(v.Q.Status) {
+			dismissed.add(statusWords(v.Q.Status))
+			continue
+		}
+		listed.add(triageGroup(v.Q))
+		fs = append(fs, v)
+	}
+
 	// summary
 	fmt.Fprintf(&b, "## Summary\n\n")
-	fmt.Fprintf(&b, "- Confirmed findings: **%d**\n", len(in.Findings))
-	fmt.Fprintf(&b, "- Assets: ")
+	fmt.Fprintf(&b, "- Findings: **%d**%s\n", len(fs), listed.breakdown(triageGroupOrder))
+	if dismissed.total > 0 {
+		fmt.Fprintf(&b, "- Excluded at triage: **%d**%s\n", dismissed.total, dismissed.breakdown(dismissedOrder))
+	}
 	var types []string
-	for t := range in.AssetCounts {
-		types = append(types, t)
+	for t, c := range in.AssetCounts {
+		if c > 0 {
+			types = append(types, t)
+		}
 	}
 	sort.Strings(types)
+	if len(types) == 0 {
+		b.WriteString("- Assets: none recorded for this task")
+	} else {
+		b.WriteString("- Assets: ")
+	}
 	for i, t := range types {
 		if i > 0 {
 			b.WriteString(", ")
@@ -89,19 +116,23 @@ func Markdown(in Input) string {
 
 	// findings
 	fmt.Fprintf(&b, "## Findings\n\n")
-	if len(in.Findings) == 0 {
-		b.WriteString("_No vulnerabilities confirmed this time._\n\n")
-	} else {
-		fs := make([]findingView, 0, len(in.Findings))
-		for _, n := range in.Findings {
-			v := parseFinding(n)
-			v.Q = qualityFromRows(n.ID, in.Quality)
-			fs = append(fs, v)
+	if len(fs) == 0 {
+		// A duplicate or ignored finding was a real result set aside by the operator,
+		// so "nothing confirmed" is only true when every exclusion was a false positive.
+		if dismissed.total > dismissed.n["false positive"] {
+			b.WriteString("_No findings are listed: every finding of this task was excluded at triage (see the summary)._\n\n")
+		} else {
+			b.WriteString("_No vulnerabilities confirmed this time._\n\n")
 		}
+	} else {
 		sort.SliceStable(fs, func(i, j int) bool { return sevRank[fs[i].Severity] < sevRank[fs[j].Severity] })
 		for i, f := range fs {
 			fmt.Fprintf(&b, "### %d. [%s] %s\n\n", i+1, strings.ToUpper(nz(f.Severity, "info")), nz(f.Name, nz(f.VulnClass, "Uncategorized")))
 			fmt.Fprintf(&b, "%s\n\n", nz(f.Summary, ""))
+			if !f.Q.Missing && !f.Q.Unavailable {
+				// Same wording as the findings export, so both deliverables name the state alike.
+				fmt.Fprintf(&b, "- **Status**: %s\n", nz(f.Q.Status, db.FindingPending))
+			}
 			b.WriteString(qualityBullets(f.Q, true)) // honest proof strength, including its gaps
 			if f.PoC != "" {
 				fmt.Fprintf(&b, "**PoC / Evidence:**\n\n```\n%s\n```\n\n", f.PoC)
@@ -131,6 +162,70 @@ func Markdown(in Input) string {
 	}
 
 	return b.String()
+}
+
+// Summary groups of the listed findings, in the order the summary prints them. A
+// finding with a row is counted under its own triage state, named as the Status
+// bullet names it, so the summary and the listing never disagree.
+const (
+	groupNoRecord = "without a finding record"
+	groupUnknown  = "triage state unknown"
+)
+
+var triageGroupOrder = []string{"confirmed", "pending", "in progress", "resolved", "fixed", "risk accepted", groupNoRecord, groupUnknown}
+
+var dismissedOrder = []string{"false positive", "duplicate", "ignored"}
+
+// triageGroup names the summary group of a finding the report lists. A finding
+// whose row could not be read is "triage state unknown", never "pending": a
+// failed lookup says nothing about what the operator decided. An unrecognised
+// state is printed verbatim, never hidden.
+func triageGroup(q Quality) string {
+	switch {
+	case q.Unavailable:
+		return groupUnknown
+	case q.Missing:
+		return groupNoRecord
+	}
+	return statusWords(q.Status)
+}
+
+// statusWords renders a triage state for a summary line: "risk_accepted" becomes
+// "risk accepted", and an empty state is the column default, pending.
+func statusWords(status string) string {
+	return strings.ReplaceAll(nz(status, db.FindingPending), "_", " ")
+}
+
+// tally counts findings per group for one summary line.
+type tally struct {
+	total int
+	n     map[string]int
+	extra []string // groups outside the known order, in first-seen order
+}
+
+func (t *tally) add(group string) {
+	if t.n == nil {
+		t.n = map[string]int{}
+	}
+	t.total++
+	t.n[group]++
+	if t.n[group] == 1 && !slices.Contains(triageGroupOrder, group) && !slices.Contains(dismissedOrder, group) {
+		t.extra = append(t.extra, group)
+	}
+}
+
+// breakdown renders " (2 confirmed, 1 awaiting triage)", or "" when empty.
+func (t *tally) breakdown(order []string) string {
+	var parts []string
+	for _, g := range append(append([]string(nil), order...), t.extra...) {
+		if c := t.n[g]; c > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", c, g))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 func nz(s, d string) string {
