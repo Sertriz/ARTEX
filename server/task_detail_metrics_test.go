@@ -56,7 +56,7 @@ INSERT INTO findings(task_id, severity) VALUES ($1,'critical'), ($1,'high'), ($1
 	ctx, cancel := context.WithCancel(context.Background())
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	defer stopTestServer(t, s, cancel)
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,9 +3,11 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { auth } from "@/lib/auth";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
+import { isCredentialPath, type SessionDeps, sendWithSession } from "@/lib/session";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -127,25 +129,35 @@ export class ApiError extends Error {
   }
 }
 
+// browserSession is the 401 policy's view of this browser (lib/session.ts).
+const browserSession: SessionDeps = {
+  readToken: getToken,
+  clearToken: () => {
+    if (typeof window !== "undefined") auth.clearToken();
+  },
+  toLogin: () => {
+    if (typeof window !== "undefined") window.location.replace("/login");
+  },
+};
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
-  const token = getToken();
-  const r = await fetch(`/api${path}`, {
-    ...init,
-    headers: {
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers as Record<string, string> | undefined),
-    },
-  });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("Unauthorized");
-  }
+  const r = await sendWithSession(
+    path,
+    (token) =>
+      fetch(`/api${path}`, {
+        ...init,
+        headers: {
+          ...(init?.body ? { "Content-Type": "application/json" } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(init?.headers as Record<string, string> | undefined),
+        },
+      }),
+    browserSession,
+  );
+  // sendWithSession has already signed out; a login or init 401 carries the
+  // server's message and is thrown below like any other error.
+  if (r.status === 401 && !isCredentialPath(path)) throw new ApiError("Unauthorized", 401);
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
