@@ -64,7 +64,7 @@ func replayServer(t *testing.T, trafficOn, live bool) (*Server, func(body string
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	s.archiveWG.Wait()
 	<-s.side.done
-	token, err := signJWT(s.jwtKey)
+	token, err := s.issueSessionToken()
 	if err != nil {
 		t.Fatal(err)
 	}

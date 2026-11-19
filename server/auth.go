@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -158,46 +161,127 @@ func samePath(a, b string) bool {
 	return a == b
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
-func signJWT(key []byte) (string, error) {
+// tokenSubject is the only subject a console token carries: ARTEX has one
+// account.
+const tokenSubject = "ARTEX"
+
+// maxTokenBytes caps the token a request may present. A session token is
+// about 160 bytes; anything far larger is refused before it is parsed.
+const maxTokenBytes = 4 << 10
+
+// tokenParser is the only way a console token is verified. It accepts HS256
+// alone (no other HMAC size, no "none", no asymmetric algorithm keyed with the
+// HMAC secret), requires an exp claim and requires sub to be ARTEX. The library
+// rejects an expired or not-yet-valid token on its own. Strict decoding
+// refuses a last base64url character with non-zero unused bits, which would
+// otherwise give every token three more spellings that verify.
+var tokenParser = jwt.NewParser(
+	jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	jwt.WithExpirationRequired(),
+	jwt.WithSubject(tokenSubject),
+	jwt.WithStrictDecoding(),
+)
+
+// canonicalToken reports whether raw is exactly three non-empty base64url
+// segments separated by dots. The base64 decoder skips CR and LF even in strict
+// mode, and the signature is checked over the raw header and payload text
+// only, so without this check many strings would verify as one token, and each
+// would get its own change-password limiter key.
+func canonicalToken(raw string) bool {
+	dots := 0
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case c == '.':
+			if i == 0 || raw[i-1] == '.' {
+				return false
+			}
+			dots++
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return dots == 2 && raw[len(raw)-1] != '.'
+}
+
+var (
+	errNoToken      = errors.New("no token")
+	errInvalidToken = errors.New("token is invalid or expired")
+)
+
+// authInfo is what a verified request token says about the caller.
+type authInfo struct {
+	raw     string // the token as presented
+	subject string // its sub claim, always tokenSubject
+}
+
+// authInfoKey is the request-context key under which requireAuth stores the
+// authInfo of an authenticated request.
+type authInfoKey struct{}
+
+// signToken issues an HS256 token for ARTEX, signed with key and valid for ttl.
+func signToken(key []byte, ttl time.Duration) (string, error) {
+	now := time.Now()
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		Subject:   tokenSubject,
+		ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		IssuedAt:  jwt.NewNumericDate(now),
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
-func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return key, nil
-	})
-	return err == nil && t.Valid
+// issueSessionToken is the console session token login and init return.
+func (s *Server) issueSessionToken() (string, error) {
+	return signToken(s.jwtKey, jwtTTL)
 }
 
-// jwtSubject returns the subject of tokenStr when it is a valid, non-expired
-// HS256 token, and "" otherwise.
-func jwtSubject(tokenStr string, key []byte) string {
-	var claims jwt.RegisteredClaims
-	t, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return key, nil
-	})
-	if err != nil || !t.Valid {
-		return ""
+// parseToken verifies raw with key through tokenParser and returns its claims.
+// Only the canonical spelling of a token verifies, so the raw string is a
+// stable identity for it (the change-password limiter key).
+func parseToken(raw string, key []byte) (*jwt.RegisteredClaims, error) {
+	if raw == "" {
+		return nil, errNoToken
 	}
-	return claims.Subject
+	if len(raw) > maxTokenBytes || !canonicalToken(raw) {
+		return nil, errInvalidToken
+	}
+	var claims jwt.RegisteredClaims
+	if _, err := tokenParser.ParseWithClaims(raw, &claims, func(*jwt.Token) (any, error) {
+		return key, nil
+	}); err != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidToken, err)
+	}
+	return &claims, nil
+}
+
+// authenticate is the single verifier of console tokens: requireAuth, health,
+// change-password and approver all go through it. It returns errNoToken or
+// errInvalidToken (wrapped) when the request carries no valid token.
+func (s *Server) authenticate(r *http.Request) (authInfo, error) {
+	raw := extractToken(r)
+	claims, err := parseToken(raw, s.jwtKey)
+	if err != nil {
+		return authInfo{}, err
+	}
+	return authInfo{raw: raw, subject: claims.Subject}, nil
+}
+
+// requestAuth is the authInfo requireAuth stored for r. Handlers called
+// without requireAuth (tests call some directly) verify the token here.
+func (s *Server) requestAuth(r *http.Request) (authInfo, error) {
+	if info, ok := r.Context().Value(authInfoKey{}).(authInfo); ok {
+		return info, nil
+	}
+	return s.authenticate(r)
 }
 
 // approver is who a human decision is recorded for: the subject of the
-// request's session token.
+// request's session token, or "" without a valid one.
 func (s *Server) approver(r *http.Request) string {
-	return jwtSubject(extractToken(r), s.jwtKey)
+	info, err := s.requestAuth(r)
+	if err != nil {
+		return ""
+	}
+	return info.subject
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -212,25 +296,35 @@ func extractToken(r *http.Request) string {
 	return r.URL.Query().Get("token")
 }
 
-// requireAuth wraps h with JWT validation.
-// /api/auth/* and /api/health are exempt.
+// authExempt is the exact set of /api paths served without a token: what the
+// login and setup pages call before a token exists, and the health probe. The
+// match is on the exact path, never a prefix: the root mux has already
+// redirected dot segments, and a decoded %2e%2e path matches no entry.
+var authExempt = map[string]bool{
+	"/api/auth/status": true,
+	"/api/auth/init":   true,
+	"/api/auth/login":  true,
+	"/api/health":      true,
+}
+
+// requireAuth wraps h with token verification, except for the authExempt
+// paths. The verified authInfo goes into the request context.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" {
+		if authExempt[r.URL.Path] {
 			h.ServeHTTP(w, r)
 			return
 		}
-		tok := extractToken(r)
-		if tok == "" {
-			writeErr(w, 401, "Unauthorized")
+		info, err := s.authenticate(r)
+		if err != nil {
+			msg := "token is invalid or expired"
+			if errors.Is(err, errNoToken) {
+				msg = "Unauthorized"
+			}
+			writeErr(w, 401, msg)
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
-			writeErr(w, 401, "token is invalid or expired")
-			return
-		}
-		h.ServeHTTP(w, r)
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authInfoKey{}, info)))
 	})
 }
 
@@ -330,7 +424,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	s.setupMu.Lock()
 	s.setupToken = ""
 	s.setupMu.Unlock()
-	tok, err := signJWT(s.jwtKey)
+	tok, err := s.issueSessionToken()
 	if err != nil {
 		writeErr(w, 500, "token generation failed")
 		return
@@ -338,16 +432,38 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"token": tok})
 }
 
-// POST /api/auth/change-password — changes the admin password. Requires a valid
-// token (this route is under /api/auth/* which requireAuth exempts, so the token
-// is validated here) AND the current password.
+// POST /api/auth/change-password — changes the admin password. requireAuth has
+// verified the session token; the current password is required as well.
 func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	s.changePassword(w, r, pg.GetSetting, pg.SetSetting)
+}
+
+// changePassword is authChangePassword past the data-source check; getSetting
+// and setSetting are pg.GetSetting and pg.SetSetting, parameters so tests can
+// run it without PostgreSQL.
+//
+// Every attempt counts against the presented token (s.pwLimit, a limiter of
+// its own with the login parameters), so failed logins and requests with
+// another token do not count against it; a successful change clears it. While
+// the artex_token cookie is still accepted, a same-site page can spend it too.
+// A wrong current password answers 403, not 401: the browser treats any 401
+// as an expired session and signs out.
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request,
+	getSetting func(string) (string, bool, error), setSetting func(string, string) error) {
+	info, err := s.requestAuth(r)
+	if err != nil {
 		writeErr(w, 401, "Unauthorized")
+		return
+	}
+	key := passwordLimitKey(info.raw)
+	if wait := s.pwLimit.allow(key); wait > 0 {
+		secs := retryAfterSeconds(wait)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeErr(w, 429, fmt.Sprintf("Too many password change attempts, try again in %d seconds", secs))
 		return
 	}
 	var req struct {
@@ -366,7 +482,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
-	hash, ok, err := pg.GetSetting(authPassKey)
+	hash, ok, err := getSetting(authPassKey)
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
 		return
@@ -376,7 +492,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.OldPassword)); err != nil {
-		writeErr(w, 401, "Current password is wrong")
+		writeErr(w, 403, "Current password is wrong")
 		return
 	}
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
@@ -384,11 +500,24 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "Password encryption failed")
 		return
 	}
-	if err := pg.SetSetting(authPassKey, string(newHash)); err != nil {
+	if err := setSetting(authPassKey, string(newHash)); err != nil {
 		writeErr(w, 500, "Save failed: "+err.Error())
 		return
 	}
+	s.pwLimit.reset(key)
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// passwordLimitKey is the s.pwLimit key of a token: a hash, so the limiter
+// never holds a usable token.
+func passwordLimitKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return "tok:" + hex.EncodeToString(sum[:])
+}
+
+// retryAfterSeconds rounds a limiter wait up to whole seconds for Retry-After.
+func retryAfterSeconds(wait time.Duration) int {
+	return int((wait + time.Second - 1) / time.Second)
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
@@ -407,7 +536,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(string) (string, bool, error)) {
 	ip := clientIP(r, s.trustedProxies)
 	if wait := s.loginLimit.allow(ip); wait > 0 {
-		secs := int((wait + time.Second - 1) / time.Second)
+		secs := retryAfterSeconds(wait)
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 		writeErr(w, 429, fmt.Sprintf("Too many login attempts, try again in %d seconds", secs))
 		return
@@ -438,7 +567,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request, getSetting func(s
 		return
 	}
 	s.loginLimit.reset(ip)
-	tok, err := signJWT(s.jwtKey)
+	tok, err := s.issueSessionToken()
 	if err != nil {
 		writeErr(w, 500, "token generation failed")
 		return

@@ -55,6 +55,7 @@ type Server struct {
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
 
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
+	pwLimit        *loginLimiter  // per-token attempt limit on POST /api/auth/change-password
 	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
@@ -165,7 +166,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1),
-		loginLimit: newLoginLimiter(time.Now)}
+		loginLimit: newLoginLimiter(time.Now), pwLimit: newLoginLimiter(time.Now)}
 	for _, o := range opts {
 		o(s)
 	}
@@ -687,7 +688,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSideRoutes(mux)
 
-	// Auth routes — exempt from JWT check (handled in requireAuth)
+	// Auth routes. status, init and login are exempt from the token check
+	// (authExempt); change-password needs a token like every other route.
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
@@ -992,9 +994,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // cumulative token usage of fallback approval
 
-	// /api/* goes through CORS + JWT; everything else is served by the embedded
-	// frontend (public — auth is enforced client-side and on the API). With the
-	// no-embed build the webui handler just 404s (run `next dev` separately).
+	// /api/* goes through CORS (SSE streams only) + JWT; everything else is
+	// served by the embedded frontend (public — auth is enforced client-side and
+	// on the API). With the no-embed build the webui handler just 404s (run
+	// `next dev` separately).
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
@@ -1008,7 +1011,7 @@ func (s *Server) Handler() http.Handler {
 // with a valid token gets the service name and version; the web UI's top bar
 // reads the version, and sends its token.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if _, err := s.authenticate(r); err != nil {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
@@ -4286,17 +4289,49 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
+// cors lets another origin read the SSE streams (isSSEPath) and nothing else:
+// those paths get Access-Control-Allow-Origin: * and a preflight, answered
+// here with 204, that allows the Authorization, Content-Type and Last-Event-ID
+// headers. Every other /api response carries no CORS header, and its OPTIONS
+// request goes on to requireAuth and the mux (401, or 405 on the exempt
+// routes), so a cross-site page can neither read the API nor send it a
+// preflighted request. Access-Control-Allow-Credentials is never sent.
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if !isSSEPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+		h.Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(204)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isSSEPath reports whether p is one of the three event streams the browser
+// may open from another origin: under `next dev` the UI on its own port
+// connects straight to the backend, because the Next rewrite buffers streamed
+// responses, and a build with NEXT_PUBLIC_SSE_BASE points them elsewhere. It
+// matches the path, not the mux pattern: for an OPTIONS request to a GET-only
+// route mux.Handler reports no pattern.
+func isSSEPath(p string) bool {
+	switch p {
+	case "/api/logs/stream", "/api/exploration/activity/stream":
+		return true
+	}
+	rest, ok := strings.CutPrefix(p, "/api/side-questions/")
+	if !ok {
+		return false
+	}
+	id, ok := strings.CutSuffix(rest, "/events")
+	return ok && id != "" && !strings.Contains(id, "/")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
