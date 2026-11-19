@@ -11,8 +11,13 @@ import (
 )
 
 func TestStageAskOperatorImage(t *testing.T) {
+	t.Setenv("ARTEX_FILE_TOOL_CONFINE", "")
 	dir := t.TempDir()
-	src := filepath.Join(dir, "shot.png")
+	run := filepath.Join(dir, "tasks", "7", "i3")
+	if err := os.MkdirAll(run, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(run, "shot.png")
 	if err := os.WriteFile(src, []byte("fakepng"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +40,29 @@ func TestStageAskOperatorImage(t *testing.T) {
 		t.Fatalf("copy missing: %v", err)
 	}
 
+	// an image outside this task's directory is refused: another task's, one
+	// beside the keys, and a link in the run dir pointing out
+	outside := filepath.Join(dir, "jwt.png")
+	other := filepath.Join(dir, "tasks", "8", "shot.png")
+	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{outside, other} {
+		if err := os.WriteFile(p, []byte("secret"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(run, "link.png")); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{outside, other, filepath.Join(run, "link.png"), filepath.Join(run, "..", "..", "8", "shot.png")} {
+		if _, err := stageAskOperatorImage(dir, "7", p); err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("%s: expected a refusal, got %v", p, err)
+		}
+	}
+
 	// wrong extension rejected
-	bad := filepath.Join(dir, "payload.exe")
+	bad := filepath.Join(run, "payload.exe")
 	if err := os.WriteFile(bad, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +71,7 @@ func TestStageAskOperatorImage(t *testing.T) {
 	}
 
 	// missing file rejected
-	if _, err := stageAskOperatorImage(dir, "7", filepath.Join(dir, "nope.png")); err == nil {
+	if _, err := stageAskOperatorImage(dir, "7", filepath.Join(run, "nope.png")); err == nil {
 		t.Fatal("expected missing-file rejection")
 	}
 }
@@ -128,5 +154,49 @@ func TestAskOperatorEnvHandoffGuidance(t *testing.T) {
 		if !strings.Contains(desc, marker) {
 			t.Errorf("ask_operator description missing env-handoff marker %q", marker)
 		}
+	}
+}
+
+// A browser screenshot is attached from the browser MCP's output directory,
+// given as the browser tool reports it (relative to ARTEX's working directory)
+// or absolute; a link planted there still cannot reach a key.
+func TestStageAskOperatorBrowserScreenshot(t *testing.T) {
+	t.Setenv("ARTEX_FILE_TOOL_CONFINE", "")
+	t.Setenv("PLAYWRIGHT_MCP_OUTPUT_DIR", "")
+	dir := t.TempDir()
+	wd := t.TempDir()
+	t.Chdir(wd)
+	out := filepath.Join(wd, ".playwright-mcp")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "page-1.png"), []byte("fakepng"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{".playwright-mcp/page-1.png", filepath.Join(out, "page-1.png")} {
+		att, err := stageAskOperatorImage(dir, "7", p)
+		if err != nil || len(att) != 1 {
+			t.Fatalf("%s: att=%v err=%v", p, att, err)
+		}
+	}
+	// A screenshot given an explicit file name lands in the browser MCP's
+	// workspace root, ARTEX's working directory.
+	if err := os.WriteFile(filepath.Join(wd, "login.png"), []byte("fakepng"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"login.png", filepath.Join(wd, "login.png")} {
+		if att, err := stageAskOperatorImage(dir, "7", p); err != nil || len(att) != 1 {
+			t.Fatalf("%s: att=%v err=%v", p, att, err)
+		}
+	}
+	key := filepath.Join(t.TempDir(), "jwt.key")
+	if err := os.WriteFile(key, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(key, filepath.Join(out, "key.png")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageAskOperatorImage(dir, "7", ".playwright-mcp/key.png"); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("link to a key: expected a refusal, got %v", err)
 	}
 }

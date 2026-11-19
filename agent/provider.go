@@ -27,6 +27,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -628,13 +629,18 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// budget to emit OK cleanly (finish=stop).
 	// EscalateMaxTokens stays false: don't raise the cap and retry on truncation, to
 	// avoid burning tokens in a resume loop.
+	// Tools is an empty, non-nil list: a nil list makes the SDK hand the model its
+	// default tools (Bash, Read, Write, ...), which here would run in bypass mode
+	// with none of the agents' hooks, gates or confinement. The test needs no tool.
 	reply, err := agentcore.Run(ctx, agentcore.Options{
-		Provider:       prov,
-		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
-		PermissionMode: acperm.ModeBypass,
-		MaxTurns:       1,
-		MaxTokens:      8192,
-		NonStreaming:   !c.Stream, // use this profile's real send/receive mode for the connection test
+		Provider:               prov,
+		SystemPrompt:           []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
+		PermissionMode:         acperm.ModeBypass,
+		Tools:                  []actool.CoreTool{},
+		DisableBackgroundTasks: true,
+		MaxTurns:               1,
+		MaxTokens:              8192,
+		NonStreaming:           !c.Stream, // use this profile's real send/receive mode for the connection test
 	}, "ping")
 	lat := time.Since(start)
 	if err != nil {

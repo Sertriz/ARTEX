@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // A benign bbot output: one in-scope host, one out-of-scope host, one event
@@ -137,5 +139,83 @@ func TestIngestBbotScopeSplit(t *testing.T) {
 	if len(out.Assets.Results) != 1 || len(out.Assets.Errors) != 0 || out.IntelFacts != 3 ||
 		out.InScopeNotAsset != 1 || out.SkippedLines != 1 || out.OversizedLines != 0 {
 		t.Fatalf("result = %s; want 1 asset, 3 intel facts, 1 in-scope non-asset, 1 skipped line", res.Flatten())
+	}
+}
+
+// ingest_bbot reads its file in process: with the file-tool policy installed it
+// reads only from this task's directory, and nothing outside it is ingested.
+func TestIngestBbotConfined(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { _ = d.Close() })
+	task, err := d.CreateTaskWithOptions("ingest_bbot confined", "bbot-confined.example.com", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = d.DeleteTask(task.ID)
+		_, _ = d.Exec(`DELETE FROM assets WHERE domain='bbot-confined.example.com'`)
+	})
+	tsx := NewToolSet(d.Exploration(task.ExplorationID), "worker-1")
+	tsx.SetTaskID(task.ID)
+	tsx.SetAssetStore(d.Assets(), d.Companies())
+
+	data := t.TempDir()
+	prev := fileToolPolicy.Load()
+	t.Cleanup(func() { fileToolPolicy.Store(prev) })
+	t.Setenv("ARTEX_FILE_TOOL_CONFINE", "")
+	SetFileToolPolicy(FileToolPolicy{DataDir: data})
+
+	outside := filepath.Join(t.TempDir(), "output.json")
+	other := filepath.Join(data, "tasks", strconv.FormatInt(task.ID+1, 10), "output.json")
+	for _, p := range []string{outside, other} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(`{"type":"DNS_NAME","data":"bbot-confined.example.com","host":"bbot-confined.example.com","scope_distance":0}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	call := func(ctx context.Context, path string) actool.Result {
+		t.Helper()
+		in, _ := json.Marshal(map[string]string{"path": path})
+		res, err := tsx.ingestBbot().Call(ctx, in, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := call(context.Background(), outside); !res.IsError || !strings.Contains(res.Flatten(), "task run") {
+		t.Fatalf("no task in context: want a refusal, got %q", res.Flatten())
+	}
+	ctx := WithRunInfo(context.Background(), RunInfo{TaskID: task.ID})
+	for _, p := range []string{outside, other, "output.json"} {
+		if res := call(ctx, p); !res.IsError || !strings.Contains(res.Flatten(), "refused") {
+			t.Fatalf("%s: want a refusal, got %q", p, res.Flatten())
+		}
+	}
+	var n int
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE domain='bbot-confined.example.com'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("a refused file was ingested: %d assets", n)
+	}
+
+	// bbot's output inside this task's directory is ingested.
+	own := filepath.Join(data, "tasks", strconv.FormatInt(task.ID, 10), "bbot", "output.json")
+	if err := os.MkdirAll(filepath.Dir(own), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte(`{"type":"DNS_NAME","data":"bbot-confined.example.com","host":"bbot-confined.example.com","scope_distance":0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := call(ctx, own); res.IsError {
+		t.Fatalf("own task file: %s", res.Flatten())
+	}
+	if err := d.QueryRow(`SELECT count(*) FROM assets WHERE domain='bbot-confined.example.com'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("own task file: %d assets, want 1", n)
 	}
 }

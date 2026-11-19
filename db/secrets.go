@@ -27,11 +27,15 @@ import (
 // {"__artex_enc":"enc:v1:..."} over the canonical JSON. Empty values stay empty.
 // A value that fails to decrypt is an error, never returned as-is.
 
+// SecretKeyFile is the name of the at-rest encryption key inside the key
+// directory.
+const SecretKeyFile = "secret.key"
+
 const (
 	secretPrefix  = "enc:v1:"
 	sealedJSONKey = "__artex_enc"
 	secretKeyEnv  = "ARTEX_SECRET_KEY"
-	secretKeyFile = "secret.key"
+	secretKeyFile = SecretKeyFile
 )
 
 type secretColumn struct {

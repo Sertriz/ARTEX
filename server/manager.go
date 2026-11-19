@@ -432,6 +432,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.GlobalProxy() != "" })
 	// The platform's own endpoints need no target approval.
 	m.interceptor.SetDerivedExemptions(m.targetGateEndpoints)
+	if proxyAddr == "" {
+		// No proxy this run, but a CA key an earlier version left readable is
+		// still on disk.
+		traffic.RestrictCAKey(filepath.Join(dir, "traffic"))
+	}
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
